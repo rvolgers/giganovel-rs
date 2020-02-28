@@ -1,0 +1,19 @@
+https://codegolf.stackexchange.com/questions/188133/bentleys-coding-challenge-k-most-frequent-words
+
+https://www.reddit.com/r/rust/comments/fa5sbr/bentleys_coding_challenge_k_most_frequent_words/
+
+# Generate `ulysses64`:
+
+wget http://www.gutenberg.org/files/4300/4300-0.txt
+
+for i in {1..64}; do cat 4300-0.txt >> ulysses64; done
+
+# Generate `giganovel`:
+
+wget https://gist.githubusercontent.com/amakukha/d519f9b09ed593bab9632bf12176c151/raw/03e3cca4f57e3fb20cb737e2704914eaacf7dab7/giganovel.py
+
+python3 giganovel.py > giganovel
+
+md5sum giganovel
+
+# 4dcf116dc35156ec939f8cafd61bdf18  giganovel
