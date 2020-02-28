@@ -1,26 +1,28 @@
-use std::collections::HashMap;
 use std::io::Write;
-use std::fmt;
-use std::fmt::Debug;
 use std::fs;
-use std::collections::HashSet;
 use encoding_rs::mem::decode_latin1;
 use rand_python::RandomState;
 use indexmap::IndexSet;
 use regex::bytes::Regex as BytesRegex;
 use std::io::BufWriter;
 
-use fnv::{FnvHasher, FnvHashMap};
-use std::hash::{BuildHasher, BuildHasherDefault};
+use fnv::{FnvHasher, FnvHashSet};
+use std::hash::BuildHasherDefault;
 type FnvBuilder = BuildHasherDefault<FnvHasher>;
 type FnvIndexSet<K> = IndexSet<K, FnvBuilder>;
 
-
+// Seed for the random number generator, for consistent output.
+// Comment from original code follows:
+// from OEIS A001519, the title should be "Itera Aeno", md5sum = 4dcf116dc35156ec939f8cafd61bdf18
+const RANDOM_SEED: u32 = 63245986;
 
 const BOOK_SIZE: usize = 1<<30;               // 1 GB
 const DISTINCT_WORDS: usize = 5000000;        // bigger number will allow longer longest word
 const MEAN: usize = 15000;                    // bigger number will increase average word length
 const LAMBDA: f64 = 1.0 / (MEAN as f64);
+
+const VOWELS: &[u8] = b"aeiouy";
+const FORBIDDEN_REGEX: &str = "satan|lenin|stalin|hitl|naz|rus|putin";
 
 const TAB: &[u8] = b"   ";
 const LINE_WIDTH: usize = 76;
@@ -29,26 +31,6 @@ const LINE_WIDTH: usize = 76;
 struct MarkovNode {
     total: u64,
     letters: [Option<Box<MarkovNode>>; 26],
-}
-
-struct LiteralDebug<T: fmt::Display>(T);
-
-impl <T: fmt::Display> Debug for LiteralDebug<T> {
-    fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> Result<(), fmt::Error> {
-        (&self.0 as &dyn fmt::Display).fmt(fmt)
-    }
-}
-
-impl Debug for MarkovNode {
-
-    fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> Result<(), fmt::Error> {
-        fmt.debug_struct("MarkovNode")
-            .field("total", &self.total)
-            .field("letters", &LiteralDebug(&("{".to_owned() + &(self.letters.iter().enumerate().map(|(i, m)| {
-                format!("{:?}: {:?}", (b'a' + i as u8) as char, m.as_ref().map(|x| x.total).unwrap_or_default())
-            })).collect::<Vec<_>>().join(", ") + "}")))
-            .finish()
-    }
 }
 
 struct Markov {
@@ -68,7 +50,7 @@ impl Markov {
         m.total += 1;
         for letter in word {
             let index = (*letter - b'a') as usize;
-            m = (&mut m.letters[index]).get_or_insert_with(Default::default);
+            m = m.letters[index].get_or_insert_with(Default::default);
             m.total += 1;
         }
     }
@@ -76,8 +58,13 @@ impl Markov {
     fn next_letter(&self, word: &[u8], random: &mut RandomState) -> u8 {
         let mut m = &self.root;
 
+        // TODO Gotta be a better way to iterate over the last two letters
         for letter in &word[word.len().saturating_sub(2)..] {
             let index = (*letter - b'a') as usize;
+
+            // This assumes the letter must be present in the root node.
+            // This is not guaranteed to be the case, but with the chosen random
+            // seed the unwrap() happens to never fail.
             m = m.letters[index].as_ref().unwrap_or_else(|| self.root.letters[index].as_ref().unwrap());
         }
 
@@ -92,8 +79,10 @@ impl Markov {
             }
         }
 
-        // Totals of children should sum to the total of the parent
-        panic!("inconsistent tree: {:?} {}", &m, &m.letters.iter().map(|x| x.as_ref().map_or(0, |x| x.total)).sum::<u64>());
+        // Totals of children do not sum to the total of the parent, but the
+        // code above assumes it does. This is definitely a bug, but it's just
+        // never hit with the hardcoded random number generator seed...
+        panic!("inconsistent tree");
     }
 }
 
@@ -230,6 +219,9 @@ impl Book {
 
 fn main() -> Result<(), Box<dyn std::error::Error>>  {
 
+
+    println!("Getting the reference text");
+
     let data = fs::read("11940-8.txt")?;
 
     let text = decode_latin1(&data).chars().map(|c| {
@@ -249,9 +241,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>>  {
     slice = &slice[slice.find("\n").unwrap()+1..];
     slice = &slice[slice.find("\n").unwrap()+1..];
 
-    let all_words = slice.split(|c: char| !c.is_ascii_lowercase()).collect::<HashSet<_>>();
+    println!("Getting reference words");
 
-    println!("{:?}", all_words);
+    let all_words = slice.split(|c: char| !c.is_ascii_lowercase()).collect::<FnvHashSet<_>>();
+
+    println!("{} reference words", all_words.len());
+
+    println!("Training Markov chain");
 
     let mut markov = Markov::new();
 
@@ -276,28 +272,38 @@ fn main() -> Result<(), Box<dyn std::error::Error>>  {
     // }
     // dump_markov(&mut f, &markov.root, "");
 
+
+    println!("Generating artificial words");
+
+    // Initialize python-compatible RNG
+    let mut random = RandomState::new();
+    random.seed_u32(RANDOM_SEED);
+
     // IndexSet preserves insertion order as long as you don't delete anything,
     // so it can replace the separate list and set here.
+    // TODO Probably did something wrong with the type, I don't understand why
+    //      it doesn't work with just `new` instead of `with_capacity_and_hasher`.
     let mut words = FnvIndexSet::<Box<[u8]>>::with_capacity_and_hasher(DISTINCT_WORDS, Default::default());
 
-    let mut random = RandomState::new();
-    random.seed_u32(63245986);
-
-    let forbidden_regex = BytesRegex::new("satan|lenin|stalin|hitl|naz|rus|putin").unwrap();
-    let vowel_regex = BytesRegex::new("[aeiouy]").unwrap();
+    let forbidden_regex = BytesRegex::new(FORBIDDEN_REGEX).unwrap();
 
     while words.len() < DISTINCT_WORDS {
         let mut w = Vec::new();
+        let mut has_vowel = false;
         while w.len() == 0 || words.contains(w.as_slice()) {
-            w.push(markov.next_letter(w.as_slice(), &mut random));
+            let letter = markov.next_letter(w.as_slice(), &mut random);
+            w.push(letter);
+            has_vowel = has_vowel || VOWELS.contains(&letter);
         }
-        if vowel_regex.is_match(w.as_slice()) && !forbidden_regex.is_match(w.as_slice()) {
+        if has_vowel && !forbidden_regex.is_match(w.as_slice()) {
             words.insert(w.into_boxed_slice());
             if words.len() % 100000 == 0 {
                 println!("{} words generated", words.len());
             }
         }
     }
+
+    println!("Capitalizing some words");
 
     // We want to change some keys, so let's convert to a Vec now.
     let mut word_list = words.into_iter().collect::<Vec<_>>();
@@ -307,6 +313,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>>  {
             word_list[i][0].make_ascii_uppercase();
         }
     }
+
+    println!("Generating text");
 
     let mut f = BufWriter::new(fs::File::create("/tmp/giganovel.txt").unwrap());
 
