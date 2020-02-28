@@ -35,8 +35,8 @@ struct MarkovNode {
 }
 
 // Helpers for indexing into MarkovNode.letters
-fn char_to_index(c: char) -> usize { c as usize - b'a' as usize }
 fn index_to_char(i: usize) -> char { (b'a' + i as u8) as char }
+fn byte_to_index(b: u8) -> usize { b as usize - b'a' as usize }
 
 struct Markov {
     root: MarkovNode,
@@ -53,8 +53,8 @@ impl Markov {
     fn train(&mut self, word: &str) {
         let mut m = &mut self.root;
         m.total += 1;
-        for c in word.chars() {
-            m = m.letters[char_to_index(c)].get_or_insert_with(Default::default);
+        for &b in word.as_bytes() {
+            m = m.letters[byte_to_index(b)].get_or_insert_with(Default::default);
             m.total += 1;
         }
     }
@@ -62,11 +62,11 @@ impl Markov {
     fn next_letter(&self, word: &str, random: &mut RandomState) -> char {
         let mut m = &self.root;
 
-        for c in word.get(word.len().saturating_sub(2)..).unwrap().chars() {
+        for &b in word.as_bytes().get(word.len().saturating_sub(2)..).unwrap() {
             // This assumes the letter must be present in the root node.
             // This is not guaranteed to be the case, but with the chosen random
             // seed the unwrap() happens to never fail.
-            m = m.letters[char_to_index(c)].as_ref().unwrap_or_else(|| self.root.letters[char_to_index(c)].as_ref().unwrap());
+            m = m.letters[byte_to_index(b)].as_ref().unwrap_or_else(|| self.root.letters[byte_to_index(b)].as_ref().unwrap());
         }
 
         let mut num = random.randint(0, m.total - 1);
