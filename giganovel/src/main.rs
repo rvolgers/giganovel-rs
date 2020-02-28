@@ -34,6 +34,10 @@ struct MarkovNode {
     letters: [Option<Box<MarkovNode>>; 26],
 }
 
+// Helpers for indexing into MarkovNode.letters
+fn char_to_index(c: char) -> usize { c as usize - b'a' as usize }
+fn index_to_char(i: usize) -> char { (b'a' + i as u8) as char }
+
 struct Markov {
     root: MarkovNode,
 }
@@ -49,9 +53,8 @@ impl Markov {
     fn train(&mut self, word: &str) {
         let mut m = &mut self.root;
         m.total += 1;
-        for letter in word.chars() {
-            let index = letter as usize - 'a' as usize;
-            m = m.letters[index].get_or_insert_with(Default::default);
+        for c in word.chars() {
+            m = m.letters[char_to_index(c)].get_or_insert_with(Default::default);
             m.total += 1;
         }
     }
@@ -59,22 +62,21 @@ impl Markov {
     fn next_letter(&self, word: &str, random: &mut RandomState) -> char {
         let mut m = &self.root;
 
-        for letter in word.get(word.len().saturating_sub(2)..).unwrap().chars() {
-            let index = letter as usize - 'a' as usize;
-
+        for c in word.get(word.len().saturating_sub(2)..).unwrap().chars() {
             // This assumes the letter must be present in the root node.
             // This is not guaranteed to be the case, but with the chosen random
             // seed the unwrap() happens to never fail.
-            m = m.letters[index].as_ref().unwrap_or_else(|| self.root.letters[index].as_ref().unwrap());
+            m = m.letters[char_to_index(c)].as_ref().unwrap_or_else(|| self.root.letters[char_to_index(c)].as_ref().unwrap());
         }
 
-        let mut i = random.randint(0, m.total - 1);
+        let mut num = random.randint(0, m.total - 1);
+
         for index in 0..m.letters.len() {
             if let Some(ref x) = &m.letters[index] {
-                if x.total > i {
-                    return (b'a' + index as u8) as char;
+                if x.total > num {
+                    return index_to_char(index);
                 }
-                i -= x.total;
+                num -= x.total;
             }
         }
 
