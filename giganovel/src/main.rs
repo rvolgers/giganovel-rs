@@ -292,16 +292,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>>  {
 
     let forbidden_regex = Regex::new(FORBIDDEN_REGEX).unwrap();
 
-    while words.len() < DISTINCT_WORDS {
-        let mut w = String::new();
-        let mut has_vowel = false;
-        while w.len() == 0 || words.contains(&w) {
+    let mut w = String::new();
+
+    'outer: while words.len() < DISTINCT_WORDS {
+
+        w.clear();
+
+        loop {
             let letter = markov.next_letter(&w, &mut random);
             w.push(letter);
-            has_vowel = has_vowel || VOWELS.contains(letter);
+
+            // Bug in original code: as soon as it finds a word that isn't in
+            // the hashset yet it will exit this loop. But if the word contains
+            // no vowels, it will not be inserted, so next time the loop will
+            // break at that point again, instead of iterating further and
+            // maybe getting a vowel. End result: all words start with a vowel.
+            // We can exploit knowledge of this bug to skip some work.
+            if w.len() == 1 && !VOWELS.contains(letter) {
+                continue 'outer;
+            }
+            if !words.contains(&w) {
+                break;
+            }
         }
-        if has_vowel && !forbidden_regex.is_match(&w) {
-            words.insert(w);
+
+        if !forbidden_regex.is_match(&w) {
+            words.insert(w.clone());
             if words.len() % 100000 == 0 {
                 println!("{} words generated", words.len());
             }
