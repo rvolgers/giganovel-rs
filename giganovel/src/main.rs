@@ -106,12 +106,13 @@ struct Book {
     line: Vec<u8>,
     front: bool,
     capitalize: bool,
-    counter: FnvHashMap<Box<[u8]>, usize>,
+    counter: Vec<usize>,
+    words: Vec<Box<[u8]>>,
     length: usize,
 }
 
 impl Book {
-    fn new() -> Book {
+    fn new(words: Vec<Box<[u8]>>) -> Book {
         Book {
             title: Default::default(),
             author: Default::default(),
@@ -120,7 +121,8 @@ impl Book {
             line: Vec::new(),
             front: false,
             capitalize: true,
-            counter: Default::default(),
+            counter: vec![0; words.len()],
+            words,
             length: 0,
         }
     }
@@ -146,8 +148,15 @@ impl Book {
         self.front = true;
     }
 
-    fn next_word(&mut self, word: &[u8], random: &mut RandomState, write: &mut dyn Write) {
-        *self.counter.entry(word.to_owned().into_boxed_slice()).or_default() += 1;
+    fn next_word(&mut self, random: &mut RandomState, write: &mut dyn Write) {
+        let mut i = random.expovariate(LAMBDA) as usize;
+        while i >= self.words.len() {
+            i = random.expovariate(LAMBDA) as usize;
+        }
+        let word = &*self.words[i];
+
+        self.counter[i] += 1;
+
         let mut capitalized_word = word.to_owned();
         capitalized_word[0].make_ascii_uppercase();
         if !self.front {
@@ -207,12 +216,12 @@ impl Book {
         write.write_all(&self.line);
         write.write_all(b".\n");
 
-        let mut tmp = self.counter.iter().collect::<Vec<_>>();
-        tmp.as_mut_slice().sort_by_key(|&(k, v)| v);
+        let mut tmp = self.counter.iter().zip(self.words.iter()).collect::<Vec<_>>();
+        tmp.as_mut_slice().sort_by_key(|&(c, w)| c);
         write.write_all(b"\n--\n\n\n\n\n\n\nMost common words:\n");
-        for (k, v) in tmp.iter().rev().take(10) {
+        for (c, w) in tmp.iter().rev().take(10) {
             write.write_all(b"- ");
-            write.write_all(k);
+            write.write_all(w);
             write.write_all(b"\n");
         }
     }
@@ -301,12 +310,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>>  {
 
     let mut f = BufWriter::new(fs::File::create("/tmp/giganovel.txt").unwrap());
 
-    let mut book = Book::new();
+    let mut book = Book::new(word_list);
+
     while book.len() < BOOK_SIZE {
-        let i = random.expovariate(LAMBDA) as usize;
-        if i < word_list.len() {
-            book.next_word(&word_list[i], &mut random, &mut f);
-        }
+        book.next_word(&mut random, &mut f);
     }
     book.end(&mut f);
 
