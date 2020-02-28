@@ -5,6 +5,7 @@ use rand_python::RandomState;
 use indexmap::IndexSet;
 use regex::Regex;
 use std::io;
+use std::borrow;
 
 use fnv::{FnvHasher, FnvHashSet};
 use std::hash::BuildHasherDefault;
@@ -125,7 +126,8 @@ impl Book {
 
         writeln!(write, "(c) {}, {}, Public domain\n", self.year, self.verlag)?;
 
-        self.line = TAB.to_owned();
+        self.line.clear();
+        self.line += TAB;
         self.front = true;
 
         Ok(())
@@ -140,39 +142,51 @@ impl Book {
 
         self.counter[i] += 1;
 
-        let mut capitalized_word = word.clone();
-        capitalized_word[0..1].make_ascii_uppercase();
+        // Put word in a Cow (copy-on-write) so we can avoid copying it if we
+        // don't end up making any changes to it such as capitalization or
+        // adding punctuation.
+        let mut word = borrow::Cow::from(word);
+        if self.capitalize {
+            word.to_mut()[0..1].make_ascii_uppercase();
+
+            // Only capitalize one word at a time, except if we're still in
+            // the front matter block, in that case following words should
+            // still be capitalized as well.
+            // In the original code capitalization is handled separately for
+            // front matter and for normal text.
+            if self.front {
+                self.capitalize = false;
+            }
+        }
+
         if !self.front {
             if self.title.split(' ').count() < 3 {
-                self.title += &capitalized_word;
+                self.title += &word;
                 self.title.push(' ');
             }
             else if self.author.split(' ').count() < 3 {
-                self.author += &capitalized_word;
+                self.author += &word;
                 self.author.push(' ');
             }
             else {
-                self.verlag += &capitalized_word;
+                self.verlag += &word;
                 self.print_front(write)?;
             }
             return Ok(());
         }
-        let mut word = word.to_owned();
-        if self.capitalize {
-            word = capitalized_word.clone();
-            self.capitalize = false;
-        }
+
         let mut paragraph = false;
         if random.randint(0, 9) == 0 {
-            word.push(',');
+            word.to_mut().push(',');
         }
         else if random.randint(0, 9) == 0 {
-            word.push('.');
+            word.to_mut().push('.');
             self.capitalize = true;
             if random.randint(0, 9) == 0 {
                 paragraph = true;
             }
         }
+
         if self.line.len() + 1 + word.len() > LINE_WIDTH {
             self.length += self.line.len() + 1;
             writeln!(write, "{}", &self.line)?;
