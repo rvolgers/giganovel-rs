@@ -10,6 +10,13 @@ use indexmap::IndexSet;
 use regex::bytes::Regex as BytesRegex;
 use std::io::BufWriter;
 
+use fnv::{FnvHasher, FnvHashMap};
+use std::hash::{BuildHasher, BuildHasherDefault};
+type FnvBuilder = BuildHasherDefault<FnvHasher>;
+type FnvIndexSet<K> = IndexSet<K, FnvBuilder>;
+
+
+
 const BOOK_SIZE: usize = 1<<30;               // 1 GB
 const DISTINCT_WORDS: usize = 5000000;        // bigger number will allow longer longest word
 const MEAN: usize = 15000;                    // bigger number will increase average word length
@@ -99,7 +106,7 @@ struct Book {
     line: Vec<u8>,
     front: bool,
     capitalize: bool,
-    counter: HashMap<Box<[u8]>, usize>,
+    counter: FnvHashMap<Box<[u8]>, usize>,
     length: usize,
 }
 
@@ -262,7 +269,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>>  {
 
     // IndexSet preserves insertion order as long as you don't delete anything,
     // so it can replace the separate list and set here.
-    let mut words = IndexSet::<Box<[u8]>>::new();
+    let mut words = FnvIndexSet::<Box<[u8]>>::with_capacity_and_hasher(DISTINCT_WORDS, Default::default());
 
     let mut random = RandomState::new();
     random.seed_u32(63245986);
