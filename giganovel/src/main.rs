@@ -3,8 +3,8 @@ use std::fs;
 use encoding_rs::mem::decode_latin1;
 use rand_python::RandomState;
 use indexmap::IndexSet;
-use regex::bytes::Regex as BytesRegex;
-use std::io::BufWriter;
+use regex::Regex;
+use std::io;
 
 use fnv::{FnvHasher, FnvHashSet};
 use std::hash::BuildHasherDefault;
@@ -21,10 +21,10 @@ const DISTINCT_WORDS: usize = 5000000;        // bigger number will allow longer
 const MEAN: usize = 15000;                    // bigger number will increase average word length
 const LAMBDA: f64 = 1.0 / (MEAN as f64);
 
-const VOWELS: &[u8] = b"aeiouy";
+const VOWELS: &str = "aeiouy";
 const FORBIDDEN_REGEX: &str = "satan|lenin|stalin|hitl|naz|rus|putin";
 
-const TAB: &[u8] = b"   ";
+const TAB: &str = "   ";
 const LINE_WIDTH: usize = 76;
 
 #[derive(Default)]
@@ -45,22 +45,21 @@ impl Markov {
         }
     }
 
-    fn train(&mut self, word: &[u8]) {
+    fn train(&mut self, word: &str) {
         let mut m = &mut self.root;
         m.total += 1;
-        for letter in word {
-            let index = (*letter - b'a') as usize;
+        for letter in word.chars() {
+            let index = letter as usize - 'a' as usize;
             m = m.letters[index].get_or_insert_with(Default::default);
             m.total += 1;
         }
     }
 
-    fn next_letter(&self, word: &[u8], random: &mut RandomState) -> u8 {
+    fn next_letter(&self, word: &str, random: &mut RandomState) -> char {
         let mut m = &self.root;
 
-        // TODO Gotta be a better way to iterate over the last two letters
-        for letter in &word[word.len().saturating_sub(2)..] {
-            let index = (*letter - b'a') as usize;
+        for letter in word.get(word.len().saturating_sub(2)..).unwrap().chars() {
+            let index = letter as usize - 'a' as usize;
 
             // This assumes the letter must be present in the root node.
             // This is not guaranteed to be the case, but with the chosen random
@@ -69,11 +68,10 @@ impl Markov {
         }
 
         let mut i = random.randint(0, m.total - 1);
-        for letter in b'a'..=b'z' {
-            let index = (letter - b'a') as usize;
+        for index in 0..m.letters.len() {
             if let Some(ref x) = &m.letters[index] {
                 if x.total > i {
-                    return letter;
+                    return (b'a' + index as u8) as char;
                 }
                 i -= x.total;
             }
@@ -88,26 +86,26 @@ impl Markov {
 
 
 struct Book {
-    title: Vec<u8>,
-    author: Vec<u8>,
-    year: Vec<u8>,
-    verlag: Vec<u8>,
-    line: Vec<u8>,
+    title: String,
+    author: String,
+    year: String,
+    verlag: String,
+    line: String,
     front: bool,
     capitalize: bool,
     counter: Vec<usize>,
-    words: Vec<Box<[u8]>>,
+    words: Vec<String>,
     length: usize,
 }
 
 impl Book {
-    fn new(words: Vec<Box<[u8]>>) -> Book {
+    fn new(words: Vec<String>) -> Book {
         Book {
             title: Default::default(),
             author: Default::default(),
-            year: b"2019"[..].into(),
+            year: "2019".to_owned(),
             verlag: Default::default(),
-            line: Vec::new(),
+            line: Default::default(),
             front: false,
             capitalize: true,
             counter: vec![0; words.len()],
@@ -120,60 +118,56 @@ impl Book {
         self.length
     }
 
-    fn print_front(&mut self, write: &mut dyn Write) {
-        self.title.as_mut_slice().make_ascii_uppercase();
-        *self.title.as_mut_slice().last_mut().unwrap() = b'\n'; // FIXME should just be rstrip and +'\n'
-        write.write_all(&self.title);
-        write.write_all(b"\n");
-        *self.author.as_mut_slice().last_mut().unwrap() = b'\n'; // FIXME should just be rstrip and +'\n'
-        write.write_all(&self.author);
-        write.write_all(b"\n");
-        write.write_all(b"(c) ");
-        write.write_all(&self.year);
-        write.write_all(b", ");
-        write.write_all(&self.verlag);
-        write.write_all(b", Public domain\n\n");
-        self.line = TAB.to_vec();
+    fn print_front(&mut self, write: &mut dyn Write) -> io::Result<()> {
+        writeln!(write, "{}\n", self.title.to_uppercase().trim_end())?;
+
+        writeln!(write, "{}\n", self.author.trim_end())?;
+
+        writeln!(write, "(c) {}, {}, Public domain\n", self.year, self.verlag)?;
+
+        self.line = TAB.to_owned();
         self.front = true;
+
+        Ok(())
     }
 
-    fn next_word(&mut self, random: &mut RandomState, write: &mut dyn Write) {
+    fn next_word(&mut self, random: &mut RandomState, write: &mut dyn Write) -> io::Result<()> {
         let mut i = random.expovariate(LAMBDA) as usize;
         while i >= self.words.len() {
             i = random.expovariate(LAMBDA) as usize;
         }
-        let word = &*self.words[i];
+        let word = &self.words[i];
 
         self.counter[i] += 1;
 
-        let mut capitalized_word = word.to_owned();
-        capitalized_word[0].make_ascii_uppercase();
+        let mut capitalized_word = word.clone();
+        capitalized_word[0..1].make_ascii_uppercase();
         if !self.front {
-            if self.title.iter().filter(|&c| *c == b' ').count() < 2 {
-                self.title.extend(capitalized_word);
-                self.title.push(b' ');
+            if self.title.split(' ').count() < 3 {
+                self.title += &capitalized_word;
+                self.title.push(' ');
             }
-            else if self.author.iter().filter(|&c| *c == b' ').count() < 2 {
-                self.author.extend(capitalized_word);
-                self.author.push(b' ');
+            else if self.author.split(' ').count() < 3 {
+                self.author += &capitalized_word;
+                self.author.push(' ');
             }
             else {
-                self.verlag.extend(capitalized_word);
-                self.print_front(write);
+                self.verlag += &capitalized_word;
+                self.print_front(write)?;
             }
-            return;
+            return Ok(());
         }
-        let mut word = word.to_vec();
+        let mut word = word.to_owned();
         if self.capitalize {
-            word = capitalized_word.to_vec();
+            word = capitalized_word.clone();
             self.capitalize = false;
         }
         let mut paragraph = false;
         if random.randint(0, 9) == 0 {
-            word.push(b',');
+            word.push(',');
         }
         else if random.randint(0, 9) == 0 {
-            word.push(b'.');
+            word.push('.');
             self.capitalize = true;
             if random.randint(0, 9) == 0 {
                 paragraph = true;
@@ -181,38 +175,38 @@ impl Book {
         }
         if self.line.len() + 1 + word.len() > LINE_WIDTH {
             self.length += self.line.len() + 1;
-            write.write_all(&self.line).unwrap();
-            write.write_all(b"\n").unwrap();
-            self.line = word;
+            writeln!(write, "{}", &self.line)?;
+            self.line.clear();
+            self.line += &word;
         }
         else if paragraph {
-            self.line.push(b' ');
-            self.line.extend(word);
-            self.line.push(b'\n');
+            self.line.push(' ');
+            self.line += &word;
+            self.line.push('\n');
             self.length += self.line.len() + 1;
-            write.write_all(&self.line).unwrap();
-            write.write_all(b"\n").unwrap();
-            self.line = TAB.to_vec();
+            writeln!(write, "{}", &self.line)?;
+            self.line.clear();
+            self.line += TAB;
         }
         else {
-            self.line.push(b' ');
-            self.line.extend(word);
+            self.line.push(' ');
+            self.line += &word;
         }
+
+        Ok(())
     }
 
-    fn end(&mut self, write: &mut dyn Write) {
-        // TODO if self.line.strip()
-        write.write_all(&self.line);
-        write.write_all(b".\n");
+    fn end(&mut self, write: &mut dyn Write) -> io::Result<()> {
+        writeln!(write, "{}.", &self.line.trim_end())?;
 
         let mut tmp = self.counter.iter().zip(self.words.iter()).collect::<Vec<_>>();
-        tmp.as_mut_slice().sort_by_key(|&(c, w)| c);
-        write.write_all(b"\n--\n\n\n\n\n\n\nMost common words:\n");
-        for (c, w) in tmp.iter().rev().take(10) {
-            write.write_all(b"- ");
-            write.write_all(w);
-            write.write_all(b"\n");
+        tmp.as_mut_slice().sort_by_key(|&(c, _)| c);
+        writeln!(write, "\n--\n\n\n\n\n\n\nMost common words:")?;
+        for (_, w) in tmp.iter().rev().take(10) {
+            writeln!(write, "- {}", &w)?;
         }
+
+        Ok(())
     }
 
 }
@@ -224,13 +218,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>>  {
 
     let data = fs::read("11940-8.txt")?;
 
-    let text = decode_latin1(&data).chars().map(|c| {
-        match c {
-            'ä' | 'Ä' | 'å' | 'Å' => 'a',
-            'ö' | 'Ö' => 'o',
-            _ => c.to_ascii_lowercase(),
-        }
-    }).collect::<String>();
+    let text = decode_latin1(&data).to_lowercase();
+    let text = text.replace("ä", "a").replace("å", "a").replace("ö", "o");
 
     let mut slice = &text[..];
     slice = &slice[slice.find("start of th").unwrap()..];
@@ -252,7 +241,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>>  {
     let mut markov = Markov::new();
 
     for word in &all_words {
-        let mut word = word.as_bytes();
+        let mut word = &word[..];
         while word.len() >= 3 {
             markov.train(word);
             word = &word[1..];
@@ -283,20 +272,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>>  {
     // so it can replace the separate list and set here.
     // TODO Probably did something wrong with the type, I don't understand why
     //      it doesn't work with just `new` instead of `with_capacity_and_hasher`.
-    let mut words = FnvIndexSet::<Box<[u8]>>::with_capacity_and_hasher(DISTINCT_WORDS, Default::default());
+    let mut words = FnvIndexSet::<String>::with_capacity_and_hasher(DISTINCT_WORDS, Default::default());
 
-    let forbidden_regex = BytesRegex::new(FORBIDDEN_REGEX).unwrap();
+    let forbidden_regex = Regex::new(FORBIDDEN_REGEX).unwrap();
 
     while words.len() < DISTINCT_WORDS {
-        let mut w = Vec::new();
+        let mut w = String::new();
         let mut has_vowel = false;
-        while w.len() == 0 || words.contains(w.as_slice()) {
-            let letter = markov.next_letter(w.as_slice(), &mut random);
+        while w.len() == 0 || words.contains(&w) {
+            let letter = markov.next_letter(&w, &mut random);
             w.push(letter);
-            has_vowel = has_vowel || VOWELS.contains(&letter);
+            has_vowel = has_vowel || VOWELS.contains(letter);
         }
-        if has_vowel && !forbidden_regex.is_match(w.as_slice()) {
-            words.insert(w.into_boxed_slice());
+        if has_vowel && !forbidden_regex.is_match(&w) {
+            words.insert(w);
             if words.len() % 100000 == 0 {
                 println!("{} words generated", words.len());
             }
@@ -305,25 +294,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>>  {
 
     println!("Capitalizing some words");
 
-    // We want to change some keys, so let's convert to a Vec now.
+    // We want to change some keys, which sets don't allow.
+    // We don't need the set functionality anymore so make it a Vec.
     let mut word_list = words.into_iter().collect::<Vec<_>>();
 
     for i in 0..word_list.len() {
         if random.randint(0, 100) == 0 {
-            word_list[i][0].make_ascii_uppercase();
+            word_list[i][0..1].make_ascii_uppercase();
         }
     }
 
     println!("Generating text");
 
-    let mut f = BufWriter::new(fs::File::create("/tmp/giganovel.txt").unwrap());
+    let mut f = io::BufWriter::new(fs::File::create("/tmp/giganovel.txt").unwrap());
 
     let mut book = Book::new(word_list);
 
     while book.len() < BOOK_SIZE {
-        book.next_word(&mut random, &mut f);
+        book.next_word(&mut random, &mut f)?;
     }
-    book.end(&mut f);
+    book.end(&mut f)?;
 
     Ok(())
 }
