@@ -8,9 +8,11 @@ const MATRIX_A: u32 = 0x9908b0df;
 const UPPER_MASK: u32 = 0x80000000;
 const LOWER_MASK: u32 = 0x7fffffff;
 
+#[derive(Clone)]
 pub struct RandomState {
     index: usize,
     state: [u32; N],
+    counter: usize,
 }
 
 impl fmt::Debug for RandomState {
@@ -29,12 +31,19 @@ impl RandomState {
         RandomState {
             index: 0,
             state: [0; N],
+            counter: 0,
         }
+    }
+
+    pub fn counter(&self) -> usize {
+        self.counter
     }
 
     fn genrand_int32(&mut self) -> u32 {
         let mut y: u32;
         let mt = &mut self.state;
+
+        self.counter += 1;
 
         if self.index >= N {
             for kk in 0..(N - M) {

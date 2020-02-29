@@ -6,9 +6,10 @@ use indexmap::IndexSet;
 use regex::Regex;
 use std::io;
 use std::borrow;
+use bitvec::prelude::{bitbox, Lsb0, BitBox};
 
 use fnv::{FnvHasher, FnvHashSet};
-use std::hash::BuildHasherDefault;
+use std::{collections::HashSet, hash::BuildHasherDefault};
 type FnvBuilder = BuildHasherDefault<FnvHasher>;
 type FnvIndexSet<K> = IndexSet<K, FnvBuilder>;
 
@@ -37,6 +38,7 @@ struct MarkovNode {
 // Helpers for indexing into MarkovNode.letters
 fn index_to_char(i: usize) -> char { (b'a' + i as u8) as char }
 fn byte_to_index(b: u8) -> usize { b as usize - b'a' as usize }
+fn char_to_index(c: char) -> usize { c as usize - b'a' as usize }
 
 struct Markov {
     root: MarkovNode,
@@ -135,7 +137,7 @@ impl Book {
         Ok(())
     }
 
-    fn next_word(&mut self, random: &mut RandomState, write: &mut dyn Write) -> io::Result<()> {
+    fn next_word<W: Write>(&mut self, random: &mut RandomState, write: &mut W) -> io::Result<()> {
         let mut i = random.expovariate(LAMBDA) as usize;
         while i >= self.words.len() {
             i = random.expovariate(LAMBDA) as usize;
@@ -284,51 +286,83 @@ fn main() -> Result<(), Box<dyn std::error::Error>>  {
     let mut random = RandomState::new();
     random.seed_u32(RANDOM_SEED);
 
-    // IndexSet preserves insertion order as long as you don't delete anything,
-    // so it can replace the separate list and set here.
-    // TODO Probably did something wrong with the type, I don't understand why
-    //      it doesn't work with just `new` instead of `with_capacity_and_hasher`.
-    let mut words = FnvIndexSet::<String>::with_capacity_and_hasher(DISTINCT_WORDS, Default::default());
+    let mut word_set = FnvHashSet::<String>::with_capacity_and_hasher(DISTINCT_WORDS, Default::default());
+
+    // With 6 entries this uses about 40mb of ram, with 7 it's about a gigabyte.
+    let mut word_set_short = [
+        bitbox![Lsb0, u64; 0; 26],
+        bitbox![Lsb0, u64; 0; 26 * 26],
+        bitbox![Lsb0, u64; 0; 26 * 26 * 26],
+        bitbox![Lsb0, u64; 0; 26 * 26 * 26 * 26],
+        bitbox![Lsb0, u64; 0; 26 * 26 * 26 * 26 * 26],
+        bitbox![Lsb0, u64; 0; 26 * 26 * 26 * 26 * 26 * 26],
+        bitbox![Lsb0, u64; 0; 26 * 26 * 26 * 26 * 26 * 26 * 26],
+    ];
+
+    let mut word_list = Vec::<String>::with_capacity(DISTINCT_WORDS);
 
     let forbidden_regex = Regex::new(FORBIDDEN_REGEX).unwrap();
 
-    let mut w = String::new();
+    const SHORT_CUTOFF: usize = 7;
+    assert!(SHORT_CUTOFF == word_set_short.len());
 
-    'outer: while words.len() < DISTINCT_WORDS {
+    let mut w = String::new();
+    let mut h: usize;
+
+    let mut short_reads: usize = 0;
+    let mut short_writes: usize = 0;
+    let mut long_reads: usize = 0;
+    let mut long_writes: usize = 0;
+
+    while word_list.len() < DISTINCT_WORDS {
+
+        let mut letter;
 
         w.clear();
 
+        // Bug in original code: as soon as it finds a word that isn't in
+        // the hashset yet it will exit this loop. But if the word contains
+        // no vowels, it will not be inserted, so next time the loop will
+        // break at that point again, instead of iterating further and
+        // maybe getting a vowel. End result: all words start with a vowel.
+        // We can exploit knowledge of this bug to skip some work.
         loop {
-            let letter = markov.next_letter(&w, &mut random);
-            w.push(letter);
-
-            // Bug in original code: as soon as it finds a word that isn't in
-            // the hashset yet it will exit this loop. But if the word contains
-            // no vowels, it will not be inserted, so next time the loop will
-            // break at that point again, instead of iterating further and
-            // maybe getting a vowel. End result: all words start with a vowel.
-            // We can exploit knowledge of this bug to skip some work.
-            if w.len() == 1 && !VOWELS.contains(letter) {
-                continue 'outer;
-            }
-            if !words.contains(&w) {
+            letter = markov.next_letter(&w, &mut random);
+            if VOWELS.contains(letter) {
                 break;
             }
         }
 
+        w.push(letter);
+        h = char_to_index(letter);
+
+        while if w.len() <= SHORT_CUTOFF { short_reads += 1; word_set_short[w.len()-1][h] } else { long_reads += 1; word_set.contains(&w) } {
+            letter = markov.next_letter(&w, &mut random);
+            w.push(letter);
+            if w.len() <= SHORT_CUTOFF {
+                h = h * 26 + char_to_index(letter);
+            }
+        }
+
         if !forbidden_regex.is_match(&w) {
-            words.insert(w.clone());
-            if words.len() % 100000 == 0 {
-                println!("{} words generated", words.len());
+            if w.len() <= SHORT_CUTOFF {
+                word_set_short[w.len()-1].set(h, true);
+                short_writes += 1;
+            } else {
+                word_set.insert(w.clone());
+                long_writes += 1;
+            }
+            word_list.push(w.clone());
+            if word_list.len() % 100000 == 0 {
+                println!("{} words generated", word_list.len());
             }
         }
     }
 
-    println!("Capitalizing some words");
+    println!("writes: long: {:-10}, short: {:-10}", long_writes, short_writes);
+    println!(" reads: long: {:-10}, short: {:-10}", long_reads, short_reads);
 
-    // We want to change some keys, which sets don't allow.
-    // We don't need the set functionality anymore so make it a Vec.
-    let mut word_list = words.into_iter().collect::<Vec<_>>();
+    println!("Capitalizing some words");
 
     for i in 0..word_list.len() {
         if random.randint(0, 100) == 0 {
@@ -346,6 +380,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>>  {
         book.next_word(&mut random, &mut f)?;
     }
     book.end(&mut f)?;
+
+    println!("rand iterations: {}", random.counter());
 
     Ok(())
 }
