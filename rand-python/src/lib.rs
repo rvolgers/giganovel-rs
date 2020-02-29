@@ -46,16 +46,24 @@ impl RandomState {
         self.counter += 1;
 
         if self.index >= N {
+            // Produce an entire block of outputs at once.
+            // The calculation for each entry is the same, but the loop is split into
+            // three separate parts according to which indexing operations overflow,
+            // to avoid needing modulo operations or conditionals in the loop itself.
+
+            // Process initial items, where kk+M and kk+1 both don't wrap
             for kk in 0..(N - M) {
                 y = (mt[kk] & UPPER_MASK) | (mt[kk + 1] & LOWER_MASK);
                 mt[kk] = mt[kk + M] ^ (y >> 1) ^ ((y & 1) * MATRIX_A);
             }
 
+            // Process next items, where kk+M wraps but kk+1 doesn't
             for kk in (N - M)..(N - 1) {
                 y = (mt[kk] & UPPER_MASK) | (mt[kk + 1] & LOWER_MASK);
                 mt[kk] = mt[kk - (N - M)] ^ (y >> 1) ^ ((y & 1) * MATRIX_A);
             }
 
+            // Process final item, where both kk+M and kk+1 wrap
             y = (mt[N - 1] & UPPER_MASK) | (mt[0] & LOWER_MASK);
             mt[N - 1] = mt[M - 1] ^ (y >> 1) ^ ((y & 1) * MATRIX_A);
 
@@ -73,13 +81,18 @@ impl RandomState {
     }
 
     fn init_genrand(&mut self, s: u32) {
+
         let mt = &mut self.state;
 
         mt[0] = s;
-        for mti in 1..N {
-            mt[mti] = 1812433253u32
-                .wrapping_mul(mt[mti - 1] ^ (mt[mti - 1] >> 30))
-                .wrapping_add(mti as u32);
+
+        let mut i: usize = 1;
+
+        for _ in 1..N {
+            mt[i] = (mt[i - 1] ^ (mt[i - 1] >> 30)).wrapping_mul(1812433253)
+                .wrapping_add(i as u32);
+
+            i += 1;
         }
         self.index = N;
     }
@@ -90,28 +103,34 @@ impl RandomState {
 
         let mt = &mut self.state;
 
+        // Cycles through 1..N, which has length N-1, not N.
+        // The zero index is "skipped over" and handled specially.
         let mut i: usize = 1;
+
+        // Cycles through the valid indices of init_key.
         let mut j: usize = 0;
 
         for _ in 0..max(N, init_key.len()) {
-            mt[i] = (mt[i] ^ ((mt[i - 1] ^ (mt[i - 1] >> 30)).wrapping_mul(1664525)))
+            mt[i] = ((mt[i - 1] ^ (mt[i - 1] >> 30)).wrapping_mul(1664525) ^ mt[i])
                 .wrapping_add(init_key[j])
                 .wrapping_add(j as u32);
 
             i += 1;
-            j += 1;
             if i >= N {
                 mt[0] = mt[N - 1];
                 i = 1;
             }
+
+            j += 1;
             if j >= init_key.len() {
                 j = 0;
             }
         }
 
         for _ in 0..(N - 1) {
-            mt[i] = (mt[i] ^ ((mt[i - 1] ^ (mt[i - 1] >> 30)).wrapping_mul(1566083941)))
+            mt[i] = ((mt[i - 1] ^ (mt[i - 1] >> 30)).wrapping_mul(1566083941) ^ mt[i])
                 .wrapping_sub(i as u32);
+
             i += 1;
             if i >= N {
                 mt[0] = mt[N - 1];
@@ -154,14 +173,41 @@ impl RandomState {
         self.init_by_array(slice::from_ref(&s));
     }
 
-    pub fn random(&mut self) -> f64 {
-        let a = self.genrand_int32() >> 5;
-        let b = self.genrand_int32() >> 6;
-        (a as f64 * 67108864.0 + b as f64) * (1.0 / 9007199254740992.0)
+    /// Original implementation of genrand_res53, using u32 and f64.
+    /// Used by default on 32 bit systems.
+    pub fn genrand_res53_32(&mut self) -> f64 {
+        let a = self.genrand_int32() >> 5;  // 32 - 5 = 27 bits
+        let b = self.genrand_int32() >> 6;  // 32 - 6 = 26 bits
+        // This is essentially doing ((a << 26) + b) / 2**53, but combining
+        // a and b is done in floating point because on 32 bits systems the
+        // CPU often has native support for f64 but not u64.
+        // 2**26 == 67108864
+        // 2**53 == 9007199254740992
+        (a as f64 * 67108864.0 + b as f64) / 9007199254740992.0
+    }
+
+    /// Alternative implementation of genrand_res53 using u64 and f64.
+    /// Used by default on 64 bit systems.
+    pub fn genrand_res53_64(&mut self) -> f64 {
+        let a = (self.genrand_int32() >> 5) as u64;
+        let b = (self.genrand_int32() >> 6) as u64;
+        ((a << 26) | b) as f64 / 9007199254740992.0
+    }
+
+    /// Generates a random f64 on [0,1) with 53-bit resolution.
+    /// This is the maximum resolution for a f64 value.
+    pub fn genrand_res53(&mut self) -> f64 {
+        #[cfg(target_pointer_width = "64")]
+        {
+            self.genrand_res53_64()
+        }
+        #[cfg(not(target_pointer_width = "64"))] {
+            self.genrand_res53_32()
+        }
     }
 
     pub fn expovariate(&mut self, lambda: f64) -> f64 {
-        -(1.0 - self.random()).ln() / lambda
+        -(1.0 - self.genrand_res53()).ln() / lambda
     }
 
     pub fn shuffle<T>(&mut self, x: &mut [T]) {
@@ -206,7 +252,7 @@ mod tests {
 
         // println!("{:?}", &rand);
 
-        assert_eq!(rand.random(), 0.5213761361171212);
+        assert_eq!(rand.genrand_res53(), 0.5213761361171212);
 
         assert_eq!(rand.randbelow(100000u64), 58671);
 
