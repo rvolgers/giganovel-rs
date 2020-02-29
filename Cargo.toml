@@ -3,3 +3,6 @@
 members = [
     "rand-python", "giganovel"
 ]
+
+[profile.release]
+debug = true
