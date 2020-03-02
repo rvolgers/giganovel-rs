@@ -184,8 +184,8 @@ impl MersenneTwister {
         let mut j: usize = 0;
 
         for _ in 0..max(N, init_key.len()) {
-            mt[i] = ((mt[i - 1] ^ (mt[i - 1] >> 30))
-                .wrapping_mul(1664525) ^ mt[i])
+            let prev = mt[i - 1] ^ (mt[i - 1] >> 30);
+            mt[i] = (mt[i] ^ prev.wrapping_mul(1664525))
                 .wrapping_add(init_key[j])
                 .wrapping_add(j as u32);
 
@@ -202,8 +202,8 @@ impl MersenneTwister {
         }
 
         for _ in 0..(N - 1) {
-            mt[i] = ((mt[i - 1] ^ (mt[i - 1] >> 30))
-                .wrapping_mul(1566083941) ^ mt[i])
+            let prev = mt[i - 1] ^ (mt[i - 1] >> 30);
+            mt[i] = (mt[i] ^ prev.wrapping_mul(1566083941))
                 .wrapping_sub(i as u32);
 
             i += 1;
@@ -232,14 +232,10 @@ impl MersenneTwister {
 
         mt[0] = s;
 
-        let mut i: usize = 1;
-
-        for _ in 1..N {
-            mt[i] = (mt[i - 1] ^ (mt[i - 1] >> 30))
-                .wrapping_mul(1812433253)
+        for i in 1..N {
+            let prev = mt[i - 1] ^ (mt[i - 1] >> 30);
+            mt[i] = prev.wrapping_mul(1812433253)
                 .wrapping_add(i as u32);
-
-            i += 1;
         }
 
         self.index = INITIAL_INDEX;  // == N
@@ -336,6 +332,7 @@ impl MersenneTwister {
         let mt = &mut self.state;
 
         mt[0] = seed;
+
         for i in 1..N {
             mt[i] = mt[i - 1].wrapping_mul(69069);
         }
