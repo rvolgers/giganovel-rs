@@ -1,158 +1,40 @@
-use std::cmp::max;
-use std::fmt;
+mod mersenne_twister;
+
 use std::slice;
 
-const N: usize = 624;
-const M: usize = 397;
-const MATRIX_A: u32 = 0x9908b0df;
-const UPPER_MASK: u32 = 0x80000000;
-const LOWER_MASK: u32 = 0x7fffffff;
-
-#[derive(Clone)]
-pub struct RandomState {
-    index: usize,
-    state: [u32; N],
-    counter: usize,
-}
-
-impl fmt::Debug for RandomState {
-    fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
-        fmt.debug_struct("RandomState")
-            .field("index", &self.index)
-            .field("state", &&self.state[..])
-            .finish()
-    }
-}
+pub use mersenne_twister::MersenneTwister;
 
 type BigInt = u64; // could use `num` module to make this generic so you can use bigints etc
 
-impl RandomState {
-    pub fn new() -> RandomState {
-        RandomState {
-            index: 0,
-            state: [0; N],
-            counter: 0,
+
+pub struct PythonRandom {
+    mersenne_twister: MersenneTwister,
+}
+
+
+impl PythonRandom {
+    pub fn new(mt: MersenneTwister) -> PythonRandom {
+        PythonRandom {
+            mersenne_twister: mt,
         }
     }
 
-    pub fn counter(&self) -> usize {
-        self.counter
+    pub fn random(&mut self) -> f64 {
+        self.mersenne_twister.genrand_res53()
     }
 
-    fn genrand_int32(&mut self) -> u32 {
-        let mut y: u32;
-        let mt = &mut self.state;
-
-        self.counter += 1;
-
-        if self.index >= N {
-            // Produce an entire block of outputs at once.
-            // The calculation for each entry is the same, but the loop is split into
-            // three separate parts according to which indexing operations overflow,
-            // to avoid needing modulo operations or conditionals in the loop itself.
-
-            // Process initial items, where kk+M and kk+1 both don't wrap
-            for kk in 0..(N - M) {
-                y = (mt[kk] & UPPER_MASK) | (mt[kk + 1] & LOWER_MASK);
-                mt[kk] = mt[kk + M] ^ (y >> 1) ^ ((y & 1) * MATRIX_A);
-            }
-
-            // Process next items, where kk+M wraps but kk+1 doesn't
-            for kk in (N - M)..(N - 1) {
-                y = (mt[kk] & UPPER_MASK) | (mt[kk + 1] & LOWER_MASK);
-                mt[kk] = mt[kk - (N - M)] ^ (y >> 1) ^ ((y & 1) * MATRIX_A);
-            }
-
-            // Process final item, where both kk+M and kk+1 wrap
-            y = (mt[N - 1] & UPPER_MASK) | (mt[0] & LOWER_MASK);
-            mt[N - 1] = mt[M - 1] ^ (y >> 1) ^ ((y & 1) * MATRIX_A);
-
-            self.index = 0;
-        }
-
-        y = mt[self.index];
-        self.index += 1;
-
-        y ^= y >> 11;
-        y ^= (y << 7) & 0x9d2c5680;
-        y ^= (y << 15) & 0xefc60000;
-        y ^= y >> 18;
-        y
-    }
-
-    fn init_genrand(&mut self, s: u32) {
-
-        let mt = &mut self.state;
-
-        mt[0] = s;
-
-        let mut i: usize = 1;
-
-        for _ in 1..N {
-            mt[i] = (mt[i - 1] ^ (mt[i - 1] >> 30)).wrapping_mul(1812433253)
-                .wrapping_add(i as u32);
-
-            i += 1;
-        }
-        self.index = N;
-    }
-
-    fn init_by_array(&mut self, init_key: &[u32]) {
-
-        self.init_genrand(19650218);
-
-        let mt = &mut self.state;
-
-        // Cycles through 1..N, which has length N-1, not N.
-        // The zero index is "skipped over" and handled specially.
-        let mut i: usize = 1;
-
-        // Cycles through the valid indices of init_key.
-        let mut j: usize = 0;
-
-        for _ in 0..max(N, init_key.len()) {
-            mt[i] = ((mt[i - 1] ^ (mt[i - 1] >> 30)).wrapping_mul(1664525) ^ mt[i])
-                .wrapping_add(init_key[j])
-                .wrapping_add(j as u32);
-
-            i += 1;
-            if i >= N {
-                mt[0] = mt[N - 1];
-                i = 1;
-            }
-
-            j += 1;
-            if j >= init_key.len() {
-                j = 0;
-            }
-        }
-
-        for _ in 0..(N - 1) {
-            mt[i] = ((mt[i - 1] ^ (mt[i - 1] >> 30)).wrapping_mul(1566083941) ^ mt[i])
-                .wrapping_sub(i as u32);
-
-            i += 1;
-            if i >= N {
-                mt[0] = mt[N - 1];
-                i = 1;
-            }
-        }
-
-        mt[0] = 0x80000000;
-    }
-
-    fn getrandbits(&mut self, k: u32) -> BigInt {
+    pub fn getrandbits(&mut self, k: u32) -> BigInt {
         assert!(0 < k && k <= BigInt::from(0u8).leading_zeros());
 
         if k <= 32 {
-            return BigInt::from(self.genrand_int32() >> (32 - k));
+            return BigInt::from(self.mersenne_twister.genrand_int32() >> (32 - k));
         }
 
         let mut tmp = BigInt::from(0u8);
         let mut k = k;
         let mut shift = 0;
         while k > 0 {
-            tmp |= BigInt::from(self.genrand_int32() >> 32u32.saturating_sub(k)) << shift;
+            tmp |= BigInt::from(self.mersenne_twister.genrand_int32() >> 32u32.saturating_sub(k)) << shift;
             k = k.saturating_sub(32);
             shift += 32;
         }
@@ -160,7 +42,7 @@ impl RandomState {
         tmp
     }
 
-    fn randbelow(&mut self, n: BigInt) -> BigInt {
+    pub fn randbelow(&mut self, n: BigInt) -> BigInt {
         let n_bits = BigInt::from(0u8).leading_zeros() - n.leading_zeros();
         let mut r = self.getrandbits(n_bits);
         while r >= n {
@@ -170,48 +52,15 @@ impl RandomState {
     }
 
     pub fn seed_u32(&mut self, s: u32) {
-        self.init_by_array(slice::from_ref(&s));
-    }
-
-    /// Original implementation of genrand_res53, using u32 and f64.
-    /// Used by default on 32 bit systems.
-    pub fn genrand_res53_32(&mut self) -> f64 {
-        let a = self.genrand_int32() >> 5;  // 32 - 5 = 27 bits
-        let b = self.genrand_int32() >> 6;  // 32 - 6 = 26 bits
-        // This is essentially doing ((a << 26) + b) / 2**53, but combining
-        // a and b is done in floating point because on 32 bits systems the
-        // CPU often has native support for f64 but not u64.
-        // 2**26 == 67108864
-        // 2**53 == 9007199254740992
-        (a as f64 * 67108864.0 + b as f64) / 9007199254740992.0
-    }
-
-    /// Alternative implementation of genrand_res53 using u64 and f64.
-    /// Used by default on 64 bit systems.
-    pub fn genrand_res53_64(&mut self) -> f64 {
-        let a = (self.genrand_int32() >> 5) as u64;
-        let b = (self.genrand_int32() >> 6) as u64;
-        ((a << 26) | b) as f64 / 9007199254740992.0
-    }
-
-    /// Generates a random f64 on [0,1) with 53-bit resolution.
-    /// This is the maximum resolution for a f64 value.
-    pub fn genrand_res53(&mut self) -> f64 {
-        #[cfg(target_pointer_width = "64")]
-        {
-            self.genrand_res53_64()
-        }
-        #[cfg(not(target_pointer_width = "64"))] {
-            self.genrand_res53_32()
-        }
+        self.mersenne_twister.init_by_array(slice::from_ref(&s));
     }
 
     pub fn expovariate(&mut self, lambda: f64) -> f64 {
-        -(1.0 - self.genrand_res53()).ln() / lambda
+        -(1.0 - self.mersenne_twister.genrand_res53()).ln() / lambda
     }
 
     pub fn shuffle<T>(&mut self, x: &mut [T]) {
-        for i in (1..(x.len())).rev() {
+        for i in (1..x.len()).rev() {
             let j = self.randbelow(BigInt::from(i as u64) + 1) as usize;
             x.swap(i, j);
         }
@@ -246,13 +95,15 @@ mod tests {
         //
         // print(tmp)
 
-        let mut rand = RandomState::new();
+        let mt = MersenneTwister::new();
+
+        let mut rand = PythonRandom::new(mt);
 
         rand.seed_u32(63245986);
 
         // println!("{:?}", &rand);
 
-        assert_eq!(rand.genrand_res53(), 0.5213761361171212);
+        assert_eq!(rand.random(), 0.5213761361171212);
 
         assert_eq!(rand.randbelow(100000u64), 58671);
 

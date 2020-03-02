@@ -1,7 +1,7 @@
 use std::io::Write;
 use std::fs;
 use encoding_rs::mem::decode_latin1;
-use rand_python::RandomState;
+use rand_python::{PythonRandom, MersenneTwister};
 use indexmap::IndexSet;
 use regex::Regex;
 use std::io;
@@ -61,7 +61,7 @@ impl Markov {
         }
     }
 
-    fn next_letter(&self, word: &str, random: &mut RandomState) -> char {
+    fn next_letter(&self, word: &str, random: &mut PythonRandom) -> char {
         let mut m = &self.root;
 
         for &b in word.as_bytes().get(word.len().saturating_sub(2)..).unwrap() {
@@ -137,7 +137,7 @@ impl Book {
         Ok(())
     }
 
-    fn next_word<W: Write>(&mut self, random: &mut RandomState, write: &mut W) -> io::Result<()> {
+    fn next_word<W: Write>(&mut self, random: &mut PythonRandom, write: &mut W) -> io::Result<()> {
         let mut i = random.expovariate(LAMBDA) as usize;
         while i >= self.words.len() {
             i = random.expovariate(LAMBDA) as usize;
@@ -283,7 +283,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>>  {
     println!("Generating artificial words");
 
     // Initialize python-compatible RNG
-    let mut random = RandomState::new();
+    let mt = MersenneTwister::new();
+    let mut random = PythonRandom::new(mt);
     random.seed_u32(RANDOM_SEED);
 
     let mut word_set = FnvHashSet::<String>::with_capacity_and_hasher(DISTINCT_WORDS, Default::default());
@@ -381,7 +382,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>>  {
     }
     book.end(&mut f)?;
 
-    println!("rand iterations: {}", random.counter());
+    //println!("rand iterations: {}", random.counter());
 
     Ok(())
 }
