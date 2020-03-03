@@ -2,7 +2,7 @@ use std::io::Write;
 use std::fs;
 use encoding_rs::mem::decode_latin1;
 use rand_python::{PythonRandom, MersenneTwister};
-use regex::Regex;
+use aho_corasick::AhoCorasickBuilder;
 use std::io;
 use std::borrow;
 use bitvec::prelude::{bitbox, Lsb0};
@@ -19,7 +19,7 @@ const MEAN: usize = 15000;                    // bigger number will increase ave
 const LAMBDA: f64 = 1.0 / (MEAN as f64);
 
 const VOWELS: &str = "aeiouy";
-const FORBIDDEN_REGEX: &str = "satan|lenin|stalin|hitl|naz|rus|putin";
+const FORBIDDEN: &[&str] = &["satan", "lenin", "stalin", "hitl", "naz", "rus", "putin"];
 
 const TAB: &str = "   ";
 const LINE_WIDTH: usize = 76;
@@ -313,8 +313,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>>  {
     // the word_set_short optimization outweighs the benefit of not duplicating storage.
     let mut word_list = Vec::<String>::with_capacity(DISTINCT_WORDS);
 
-    // Regex to match forbidden substrings
-    let forbidden_regex = Regex::new(FORBIDDEN_REGEX).unwrap();
+    // Could also use `regex`, but for this simple case we can use aho-corasick directly
+    // and save a dependency (regex depends on this library).
+    let forbidden = AhoCorasickBuilder::new()
+        .auto_configure(FORBIDDEN)
+        .build(FORBIDDEN);
 
     // String that holds the current word.
     let mut w = String::new();
@@ -350,7 +353,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>>  {
         // it contains a vowel. Unintended consequence: every word must start
         // with a vowel. So we can just perform this check on the first letter.
         let firstchar = w.chars().next().unwrap();
-        if VOWELS.contains(firstchar) && !forbidden_regex.is_match(&w) {
+        if VOWELS.contains(firstchar) && !forbidden.is_match(&w) {
 
             // Accepted, so make a note that we've seen this word now.
             if w.len() < word_set_short.len() {
