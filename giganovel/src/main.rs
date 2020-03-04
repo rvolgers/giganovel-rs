@@ -576,6 +576,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>>  {
     // }
     // dbg!(lengths);
 
+    drop(word_bitvec);
+    //drop(word_set);
+
     println!("Capitalizing some words");
 
     for i in 0..word_list.len() {
@@ -586,16 +589,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>>  {
 
     println!("Generating text");
 
-    let mut f = io::BufWriter::with_capacity(1024 * 1024 * 4, fs::File::create("giganovel.txt").unwrap());
+    let mut writer = io::BufWriter::with_capacity(1024 * 1024 * 4, fs::File::create("giganovel.txt").unwrap());
+
+    //let mut writer = io::Cursor::new(vec![0u8; 1073742004]);
 
     let mut book = Book::new(word_list);
 
     // Random number generation has been moved to next_word() so it can directly use the generated id
     // to maintain a count of how often each word was produced instead of needing a separate hashmap.
     while book.len() < BOOK_SIZE {
-        book.next_word(&mut random, &mut f)?;
+        book.next_word(&mut random, &mut writer)?;
     }
-    book.end(&mut f)?;
+    book.end(&mut writer)?;
+
+    //fs::File::create("giganovel.txt").unwrap().write_all(writer.into_inner().as_mut())?;
 
     Ok(())
 }
