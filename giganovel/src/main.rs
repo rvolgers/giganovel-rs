@@ -172,6 +172,7 @@ fn byte_to_index(b: u8) -> usize { b as usize - b'a' as usize }
 
 struct Markov {
     root: MarkovNode,
+    huffman_vowels: [(usize, u8); 26],
 }
 
 impl Markov {
@@ -179,11 +180,22 @@ impl Markov {
     fn new() -> Markov {
         Markov {
             root: Default::default(),
+            huffman_vowels: Default::default(),
         }
     }
 
     fn huffman_letters(&mut self) {
         self.root.huffman_letters();
+
+        // Special huffman table for first character of word, which has only vowels
+        let node_iter = self.root.letters.iter_mut()
+            .flatten()
+            .filter(|m| VOWELS.contains(&m.letter))
+            .map(|n| (n.total as usize, n));
+
+        for (code, bits, n) in huffman(node_iter) {
+            self.huffman_vowels[byte_to_index(n.letter)] = (code, bits);
+        }
     }
 
     fn pack(&mut self) {
@@ -226,10 +238,18 @@ impl Markov {
         for x in m.iter_present() {
             if x.total > num {
 
-                huffman.0 = (huffman.0.wrapping_shl(x.huffman.1 as u32)) | x.huffman.0;
-                huffman.1 = huffman.1.checked_add(x.huffman.1 as u32).unwrap();
+                let next_huffman = if word_tail.len() == 0 {
+                    self.huffman_vowels[byte_to_index(x.letter)]
+                } else {
+                    x.huffman
+                };
 
-                assert!(huffman.1 >= 63 || huffman.0 < (1usize << huffman.1), "{:?} {:?}", huffman, x.huffman);
+                // assert!(next_huffman.1 != 0);
+
+                huffman.0 = (huffman.0.wrapping_shl(next_huffman.1 as u32)) | next_huffman.0;
+                huffman.1 = huffman.1.checked_add(next_huffman.1 as u32).unwrap();
+
+                assert!(huffman.1 >= 63 || huffman.0 < (1usize << huffman.1), "{:?} {:?}", huffman, next_huffman);
 
                 return x.letter;
             }
@@ -487,7 +507,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>>  {
 
     let mut word_set = FnvHashSet::<BString>::with_capacity_and_hasher(0, Default::default());
 
-    const SET_BITS: usize = 33;
+    const SET_BITS: usize = 32;
 
     let mut word_bitvec = bitbox![Lsb0, u64; 0; 1usize << SET_BITS];
 
@@ -572,6 +592,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>>  {
             let word_tail = &w[w.len().saturating_sub(2)..];
 
             let letter = markov.next_letter(word_tail, &mut random, &mut huffman);
+
             w.push(letter);
 
             huffmaxbits = huffman.1.max(huffmaxbits);
@@ -579,6 +600,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>>  {
             //markov.next_eof(&w[w.len().saturating_sub(2)..], &huffman, &mut eof_huffman);
 
             huffindex = None;
+
+
+            if w.len() == 1 && !VOWELS.contains(&w.as_bytes()[0]) {
+                break;
+            }
+
+            assert!(huffman.1 != 0, "wat {:?} {:?}", w, huffman);
+
             // TODO debug the eof-in-huffman code.
             // The reason for wanting a dedicated eof symbol at the end is that it might improve
             // locality near the end of the hashing maybe?
