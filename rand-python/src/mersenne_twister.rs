@@ -121,6 +121,12 @@ impl MersenneTwister {
             assert!(self.index != UNSEEDED_INDEX,
                 "random number generator must be seeded before use");
 
+            unsafe {
+                for i in (0..N).step_by(64) {
+                    core::arch::x86_64::_mm_prefetch((mt as *const _ as *const i8).add(i), core::arch::x86_64::_MM_HINT_T1);
+                }
+            }
+
             // Produce an entire block of outputs at once.
             // The calculation for each entry is the same, but the loop is split into
             // three separate parts according to which indexing calculations will wrap,
