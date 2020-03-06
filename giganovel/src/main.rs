@@ -6,7 +6,7 @@ use aho_corasick::AhoCorasickBuilder;
 use std::{fmt::Debug, io};
 use bitvec::prelude::{bitbox, Lsb0};
 use fnv::FnvHashSet;
-use bstr::{BString, ByteSlice};
+use bstr::{BString, BStr, ByteSlice};
 
 // Seed for the random number generator, for consistent output.
 // Comment from original code follows:
@@ -24,6 +24,9 @@ const FORBIDDEN: &[&str] = &["satan", "lenin", "stalin", "hitl", "naz", "rus", "
 const TAB: &[u8] = b"   ";
 const LINE_WIDTH: usize = 76;
 
+
+
+const WORD_SIZE: usize = 16;
 
 // TODO use a ready made huffman crate?
 // TODO lots of allocation happening here, not tried to optimize yet
@@ -71,9 +74,14 @@ fn huffman<T: Debug>(weights_and_symbols: impl Iterator<Item=(usize, T)>) -> Vec
                     code |= 1;
                 },
                 Node([a, b]) => {  // Uuuugh https://github.com/rust-lang/rust/issues/25725
-                    // subtle: after this scope is done, resume with code |= 1
-                    stack.push((code | 1, bits, nodes));
-                    code <<= 1;
+                    let childcode = code << 1;
+
+                    // Save state to resume at after processing child nodes
+                    code |= 1;
+                    stack.push((code, bits, nodes));
+
+                    // Set up state for processing the child nodes
+                    code = childcode;
                     bits += 1;
                     nodes = vec![b, a];
                 },
@@ -88,12 +96,16 @@ fn huffman<T: Debug>(weights_and_symbols: impl Iterator<Item=(usize, T)>) -> Vec
 struct MarkovNode {
     total: u64,
     huffman: (usize, u8),
+    letter: u8,
+    present: u32,
     letters: [Option<Box<MarkovNode>>; 26],
     //eof_huffman: (usize, u8),
 }
 
 impl MarkovNode {
     pub fn huffman_letters(&mut self) {
+        assert!(self.present == 0);
+
         // let mut eof = [Box::new(MarkovNode::default())];
         // eof[0].total = self.letters.iter().flatten().map(|n| n.total).max().unwrap_or(1);
         // eof[0].eof_huffman = (std::usize::MAX, 0);  // Marker
@@ -111,6 +123,47 @@ impl MarkovNode {
         }
         //self.eof_huffman = eof[0].huffman;
     }
+
+    pub fn pack(&mut self) {
+        assert!(self.present == 0);
+
+        let mut dest_idx = 0;
+
+        for i in 0..26 {
+            if dest_idx < i {
+                if let Some(mut n) = self.letters[i].take() {
+                    n.pack();
+                    self.letters[dest_idx] = Some(n);
+                    dest_idx += 1;
+                    self.present |= 1 << i;
+                }
+            }
+            else if let Some(n) = &mut self.letters[i] {
+                dest_idx += 1;
+                self.present |= 1 << i;
+                n.pack();
+            }
+        }
+
+        self.present |= 1<<31;
+    }
+
+    fn iter_present(&self) -> impl Iterator<Item=&MarkovNode> {
+        let max = (self.present & ((1 << 26) - 1)).count_ones();
+        self.letters[..max as usize].iter().flatten().map(|c| c.as_ref())
+    }
+
+    fn index_packed(&self, letter: u8) -> Option<&MarkovNode> {
+        assert!(self.present != 0);
+
+        let abc_index = byte_to_index(letter);
+        let bit = 1 << abc_index;
+        if self.present & bit == 0 { return None; }
+        let offset = ((bit - 1) & self.present).count_ones();
+        let m: Option<&MarkovNode> = self.letters[offset as usize].as_ref().map(|c| c.as_ref());
+        m
+    }
+
 }
 
 // Helpers for indexing into MarkovNode.letters
@@ -133,25 +186,32 @@ impl Markov {
         self.root.huffman_letters();
     }
 
-    fn train(&mut self, word: &[u8]) {
-        let mut m = &mut self.root;
-        m.total += 1;
-        for b in word.bytes() {
-            m = m.letters[byte_to_index(b)].get_or_insert_with(Default::default);
-            m.total += 1;
-        }
+    fn pack(&mut self) {
+        self.root.pack();
     }
+
 
     fn lookup(&self, word_tail: impl Iterator<Item=u8>) -> Option<&MarkovNode> {
         let mut m = &self.root;
 
         for b in word_tail {
-            m = m.letters[byte_to_index(b)].as_ref()
-                .or_else(|| self.root.letters[byte_to_index(b)].as_ref())?;
+            m = m.index_packed(b)
+                .or_else(|| self.root.index_packed(b))?;
         }
 
         Some(m)
     }
+
+    fn train(&mut self, word: &[u8]) {
+        let mut m = &mut self.root;
+        m.total += 1;
+        for b in word.bytes() {
+            m = m.letters[byte_to_index(b)].get_or_insert_with(Default::default);
+            m.letter = b;
+            m.total += 1;
+        }
+    }
+
 
     fn next_letter(&self, word_tail: &[u8], random: &mut PythonRandom, huffman: &mut (usize, u32)) -> u8 {
         // Bug in original implementation:
@@ -163,19 +223,17 @@ impl Markov {
         assert!(m.total > 0);
         let mut num = random.randint(0, m.total - 1);
 
-        for index in 0..m.letters.len() {
-            if let Some(ref x) = &m.letters[index] {
-                if x.total > num {
+        for x in m.iter_present() {
+            if x.total > num {
 
-                    huffman.0 = (huffman.0.wrapping_shl(x.huffman.1 as u32)) | x.huffman.0;
-                    huffman.1 = huffman.1.checked_add(x.huffman.1 as u32).unwrap();
+                huffman.0 = (huffman.0.wrapping_shl(x.huffman.1 as u32)) | x.huffman.0;
+                huffman.1 = huffman.1.checked_add(x.huffman.1 as u32).unwrap();
 
-                    assert!(huffman.1 >= 63 || huffman.0 < (1usize << huffman.1), "{:?} {:?}", huffman, x.huffman);
+                assert!(huffman.1 >= 63 || huffman.0 < (1usize << huffman.1), "{:?} {:?}", huffman, x.huffman);
 
-                    return index_to_byte(index);
-                }
-                num -= x.total;
+                return x.letter;
             }
+            num -= x.total;
         }
 
         // Bug in original implementation:
@@ -197,7 +255,7 @@ impl Markov {
 }
 
 
-struct Book {
+struct Book<'a> {
     title: BString,
     author: BString,
     year: BString,
@@ -206,12 +264,12 @@ struct Book {
     front: bool,
     capitalize: bool,
     counter: Vec<usize>,
-    words: Vec<BString>,
+    words: &'a [u8],
     length: usize,
 }
 
-impl Book {
-    fn new(words: Vec<BString>) -> Book {
+impl Book<'_> {
+    fn new<'a>(words: &'a [u8]) -> Book<'a> {
         Book {
             title: Default::default(),
             author: Default::default(),
@@ -248,11 +306,14 @@ impl Book {
         // Pick a random word. This was moved to next_word so we can use the
         // generated index to count how often each word is used without needing
         // a separate hash lookup to get the count for a word.
-        let word;
+        let mut word;
         loop {
             let i = random.expovariate(LAMBDA) as usize;
-            if i < self.words.len() {
-                word = self.words[i].as_bytes();
+            if i < self.words.len() / WORD_SIZE {
+                word = &self.words[i * WORD_SIZE .. (i+1) * WORD_SIZE];
+                while word.len() > 0 && word[word.len()-1] == b'\0' {
+                    word = &word[..word.len() - 1];
+                }
                 self.counter[i] += 1;
                 break;
             }
@@ -347,15 +408,22 @@ impl Book {
         writeln!(write, "{}.", &self.line.trim_end().as_bstr())?;
 
         let mut tmp = self.counter.iter()
-            .zip(self.words.iter())
+            .zip(self.words.chunks(WORD_SIZE))
             .collect::<Vec<_>>();
 
         tmp.sort_by_key(|&(c, _)| c);
 
         writeln!(write, "\n--\n\n\n\n\n\n\nMost common words:")?;
 
-        for (_, w) in tmp.iter().rev().take(10) {
-            writeln!(write, "- {}", &w)?;
+        for (_, word) in tmp.iter().rev().take(10) {
+            let mut word: &[u8] = &word[..];
+            while word.len() > 0 && word[word.len()-1] == b'\0' {
+                word = &word[..word.len() - 1];
+            }
+            write.write_all(b"- ")?;
+            write.write_all(word)?;
+            write.write_all(b"\n")?;
+            //writeln!(write, "- {}", word)?;
         }
 
         Ok(())
@@ -408,6 +476,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>>  {
 
     markov.huffman_letters();
 
+    markov.pack();
+
     println!("Generating artificial words");
 
     // Initialize python-compatible RNG
@@ -426,7 +496,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>>  {
     // The actual ordered list of words we will use later to pick words based on random numbers.
     // We could use a set that preserves insertion order, but the hash lookups we save by using
     // the word_set_short optimization outweighs the benefit of not duplicating storage.
-    let mut word_list = Vec::<BString>::with_capacity(DISTINCT_WORDS);
+    //let mut word_list = Vec::<BString>::with_capacity(DISTINCT_WORDS);
 
     // Could also use `regex`, but for this simple case we can use aho-corasick directly
     // and save a dependency (regex depends on this library).
@@ -466,7 +536,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>>  {
     let length_huffman = {
         let mut tmp: [Option<(usize, u8)>; 20] = Default::default();
 
-        for (code, bits, length) in huffman(lengths.iter().enumerate().filter(|(_, &c)| c > 0).map(|(i, c)| (*c, i))) {
+        let weights_and_symbols_iter = lengths.iter()
+            .enumerate()
+            .filter(|(_, &count)| count > 0)
+            .map(|(length, &count)| (count, length));
+
+        for (code, bits, length) in huffman(weights_and_symbols_iter) {
             tmp[length] = Some((code, bits));
         }
 
@@ -477,7 +552,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>>  {
     let mut huffbad = 0usize;
     let mut huffmaxbits = 0u32;
 
-    while word_list.len() < DISTINCT_WORDS {
+    let mut wordbuf = vec![0u8; WORD_SIZE * DISTINCT_WORDS];
+    let mut wordbuf_write = &mut wordbuf[..];
+
+    let mut seen_above_8 = 0usize;
+
+    while wordbuf_write.len() > 0 {
 
         w.clear();
 
@@ -558,15 +638,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>>  {
                 word_set.insert(w.clone());
             }
 
-            // Put the word in the ordered list of words as well.
-            word_list.push(w.clone());
+            if w.len() > 8 {
+                seen_above_8 += 1;
+            }
+
+            let (head, tail) = wordbuf_write.split_at_mut(WORD_SIZE);
+            wordbuf_write = tail;
+            head[..w.len()].copy_from_slice(&w);
 
             // Progress report.
-            if word_list.len() % 100000 == 0 {
-                println!("{} words generated", word_list.len());
+            if (DISTINCT_WORDS - (wordbuf_write.len() / WORD_SIZE)) % 100000 == 0 {
+                println!("{} words generated", DISTINCT_WORDS - (wordbuf_write.len() / WORD_SIZE));
+                //println!("Length above 8: {}", seen_above_8);
             }
         }
     }
+
+    drop(wordbuf_write);
 
     println!("{} out of {} lookups used the word_bitvec, {} didn't, longest huffman encoded word (sans length) was {} bits", huffgood, huffgood + huffbad, huffbad, huffmaxbits);
 
@@ -581,9 +669,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>>  {
 
     println!("Capitalizing some words");
 
-    for i in 0..word_list.len() {
+    for i in 0..DISTINCT_WORDS {
         if random.randint(0, 100) == 0 {
-            word_list[i][0..1].make_ascii_uppercase();
+            wordbuf[i * WORD_SIZE..i * WORD_SIZE + 1].make_ascii_uppercase();
         }
     }
 
@@ -593,7 +681,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>>  {
 
     //let mut writer = io::Cursor::new(vec![0u8; 1073742004]);
 
-    let mut book = Book::new(word_list);
+    let mut book = Book::new(&wordbuf);
 
     // Random number generation has been moved to next_word() so it can directly use the generated id
     // to maintain a count of how often each word was produced instead of needing a separate hashmap.
