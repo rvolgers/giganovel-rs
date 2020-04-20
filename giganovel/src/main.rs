@@ -1,9 +1,12 @@
+use std::cmp::Reverse;
+use std::collections::BinaryHeap;
+use std::cmp::Ordering;
 use std::io::Write;
 use std::fs;
 use encoding_rs::mem::decode_latin1;
 use rand_python::{PythonRandom, MersenneTwister};
 use aho_corasick::AhoCorasickBuilder;
-use std::{fmt::Debug, io};
+use std::{fmt::Debug, io, cmp::PartialOrd, convert::TryInto};
 use bitvec::prelude::{bitbox, Lsb0};
 use fnv::FnvHashSet;
 use bstr::{BString, BStr, ByteSlice};
@@ -18,7 +21,7 @@ const DISTINCT_WORDS: usize = 5000000;        // bigger number will allow longer
 const MEAN: usize = 15000;                    // bigger number will increase average word length
 const LAMBDA: f64 = 1.0 / (MEAN as f64);
 
-const VOWELS: &[u8] = b"aeiouy";
+const VOWELS: &[u8; 6] = b"aeiouy";
 const FORBIDDEN: &[&str] = &["satan", "lenin", "stalin", "hitl", "naz", "rus", "putin"];
 
 const TAB: &[u8] = b"   ";
@@ -28,12 +31,59 @@ const LINE_WIDTH: usize = 76;
 
 const WORD_SIZE: usize = 16;
 
-// TODO use a ready made huffman crate?
-// TODO lots of allocation happening here, not tried to optimize yet
-fn huffman<T: Debug>(weights_and_symbols: impl Iterator<Item=(usize, T)>) -> Vec::<(usize, u8, T)> {
+/// Value type that behaves like a vector of bits with max length 64.
+/// Used for representing (sequences of) huffman codes.
+#[derive(Clone, Copy, Default, Debug)]
+struct SmolBitvec {
+    used: u8,
+    bits: u64,
+}
 
+impl SmolBitvec {
+    fn new() -> Self { Default::default() }
+
+    fn len(&self) -> u8 {
+        self.used
+    }
+
+    fn checked_extend(&self, other: &SmolBitvec) -> Option<Self> {
+        if self.used + other.used > 64  {
+            return None;
+        }
+        Some(Self {
+            used: self.used + other.used,
+            bits: (self.bits << other.used) | other.bits,
+        })
+    }
+
+    fn checked_push(&self, bit: bool) -> Option<Self> {
+        if self.used + 1 > 64 {
+            return None;
+        }
+        Some(Self {
+            used: self.used + 1,
+            bits: (self.bits << 1) | (bit as u64),
+        })
+    }
+
+    fn reverse(&self) -> Self {
+        Self {
+            used: self.used,
+            bits: self.bits.reverse_bits() >> (64 - self.used),
+        }
+    }
+
+    fn to_u64(&self) -> u64 {
+        self.bits
+    }
+}
+
+/// Generates huffman codes for a given set of symbols and their corresponding weights.
+///
+/// This does lots of allocations, but it's not called that often so probably not worth optimizing.
+fn huffman<T: Debug>(weights_and_symbols: impl Iterator<Item=(usize, T)>) -> Vec::<(SmolBitvec, T)> {
     enum HuffmanNodeContents<T> {
-        Node([Box<HuffmanNode<T>>; 2]),
+        Node(Box<HuffmanNode<T>>, Box<HuffmanNode<T>>),
         Leaf(T),
     }
 
@@ -42,51 +92,63 @@ fn huffman<T: Debug>(weights_and_symbols: impl Iterator<Item=(usize, T)>) -> Vec
         contents: HuffmanNodeContents<T>,
     }
 
-    use HuffmanNodeContents::*;
+    // Um, std::collections, all I wanted was a minheap by HuffmanNode.weight, ok?
+    // This is a crazy amount of impls you're asking for.
 
-    let mut tmp = weights_and_symbols
-        .map(|(weight, s)| Box::new(HuffmanNode { weight, contents: Leaf(s) }))
-        .collect::<Vec<_>>();
-
-    let key_func = |n: &Box<HuffmanNode<T>>| std::usize::MAX - n.weight;
-
-    tmp.sort_by_key(key_func);
-
-    while tmp.len() > 1 {
-        let a = tmp.pop().unwrap();
-        let b = tmp.pop().unwrap();
-        let new_node = Box::new(HuffmanNode {
-            weight: a.weight + b.weight,
-            contents: Node([a, b]),
-        });
-        tmp.insert(tmp.binary_search_by_key(&key_func(&new_node), key_func).unwrap_or_else(|x| x), new_node);
+    impl<T> PartialOrd for HuffmanNode<T> {
+        fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+            Some(self.cmp(other))
+        }
     }
 
-    let mut codes = Vec::<(usize, u8, T)>::new();
-    let mut stack = vec![(0usize, 0u8, tmp.pop().into_iter().collect::<Vec<_>>())];
-
-    // TODO just use recursion for this?
-    while let Some((mut code, mut bits, mut nodes)) = stack.pop() {
-        while let Some(node) = nodes.pop() {
-            match node.contents {
-                Leaf(t) => {
-                    codes.push((code, bits, t));
-                    code |= 1;
-                },
-                Node([a, b]) => {  // Uuuugh https://github.com/rust-lang/rust/issues/25725
-                    let childcode = code << 1;
-
-                    // Save state to resume at after processing child nodes
-                    code |= 1;
-                    stack.push((code, bits, nodes));
-
-                    // Set up state for processing the child nodes
-                    code = childcode;
-                    bits += 1;
-                    nodes = vec![b, a];
-                },
-            }
+    impl<T> Ord for HuffmanNode<T> {
+        fn cmp(&self, other: &Self) -> Ordering {
+            self.weight.cmp(&other.weight).reverse()
         }
+    }
+
+    impl<T> PartialEq for HuffmanNode<T> {
+        fn eq(&self, other: &Self) -> bool {
+            self.weight == other.weight
+        }
+    }
+
+    impl<T> Eq for HuffmanNode<T> {}
+
+    // Initialize heap with every node a leaf node
+    let mut heap = weights_and_symbols
+        .map(|(weight, s)| Box::new(HuffmanNode { weight, contents: HuffmanNodeContents::Leaf(s) }))
+        .collect::<BinaryHeap<_>>();
+
+    // Put the two nodes with lowest weight under a new common parent until a single node remains.
+    while heap.len() > 1 {
+        let a = heap.pop().unwrap();
+        let b = heap.pop().unwrap();
+        heap.push( Box::new(HuffmanNode {
+            weight: a.weight + b.weight,
+            contents: HuffmanNodeContents::Node(a, b),
+        }));
+    }
+
+    let mut codes = Vec::<(SmolBitvec, T)>::new();
+
+    // Walk the tree, appending the symbol and the huffman code for each leaf node to `codes`.
+    // Use recursion for simplicity here since we will never have many nodes.
+    // (Note that heap.pop().is_none() can happen here, but only if the input was zero length.)
+    if let Some(root) = heap.pop() {
+        fn collect<T>(node: Box<HuffmanNode<T>>, code: SmolBitvec, dest: &mut Vec<(SmolBitvec, T)>) {
+            match node.contents {
+                HuffmanNodeContents::Node(a, b) => {
+                    collect(a, code.checked_push(false).unwrap(), dest);
+                    collect(b, code.checked_push(true).unwrap(), dest);
+                }
+                HuffmanNodeContents::Leaf(t) => {
+                    dest.push((code, t));
+                }
+            }
+        };
+
+        collect(root, SmolBitvec::new(), &mut codes);
     }
 
     codes
@@ -95,7 +157,7 @@ fn huffman<T: Debug>(weights_and_symbols: impl Iterator<Item=(usize, T)>) -> Vec
 #[derive(Default, Debug)]
 struct MarkovNode {
     total: u64,
-    huffman: (usize, u8),
+    huffman: SmolBitvec,
     letter: u8,
     present: u32,
     letters: [Option<Box<MarkovNode>>; 26],
@@ -106,22 +168,13 @@ impl MarkovNode {
     pub fn huffman_letters(&mut self) {
         assert!(self.present == 0);
 
-        // let mut eof = [Box::new(MarkovNode::default())];
-        // eof[0].total = self.letters.iter().flatten().map(|n| n.total).max().unwrap_or(1);
-        // eof[0].eof_huffman = (std::usize::MAX, 0);  // Marker
         let node_iter = self.letters.iter_mut()
             .flatten()
-            //.chain(eof.iter_mut())
             .map(|n| (n.total as usize, n));
-        for (code, bits, n) in huffman(node_iter) {
-            n.huffman = (code, bits);
-
-            // Prevent infinite recursion
-            //if n.eof_huffman != (std::usize::MAX, 0) {
-                n.huffman_letters();
-            //}
+        for (code, n) in huffman(node_iter) {
+            n.huffman = code;
+            n.huffman_letters();
         }
-        //self.eof_huffman = eof[0].huffman;
     }
 
     pub fn pack(&mut self) {
@@ -172,7 +225,7 @@ fn byte_to_index(b: u8) -> usize { b as usize - b'a' as usize }
 
 struct Markov {
     root: MarkovNode,
-    huffman_vowels: [(usize, u8); 26],
+    huffman_vowels: [SmolBitvec; 26],
 }
 
 impl Markov {
@@ -193,8 +246,8 @@ impl Markov {
             .filter(|m| VOWELS.contains(&m.letter))
             .map(|n| (n.total as usize, n));
 
-        for (code, bits, n) in huffman(node_iter) {
-            self.huffman_vowels[byte_to_index(n.letter)] = (code, bits);
+        for (code, n) in huffman(node_iter) {
+            self.huffman_vowels[byte_to_index(n.letter)] = code;
         }
     }
 
@@ -225,7 +278,7 @@ impl Markov {
     }
 
 
-    fn next_letter(&self, word_tail: &[u8], random: &mut PythonRandom, huffman: &mut (usize, u32)) -> u8 {
+    fn next_letter(&self, word_tail: &[u8], random: &mut PythonRandom, huffman: &mut Option<SmolBitvec>) -> u8 {
         // Bug in original implementation:
         // This assumes the letter must be present in the root node.
         // This is not guaranteed to be the case, but with the chosen
@@ -239,17 +292,12 @@ impl Markov {
             if x.total > num {
 
                 let next_huffman = if word_tail.len() == 0 {
-                    self.huffman_vowels[byte_to_index(x.letter)]
+                    &self.huffman_vowels[byte_to_index(x.letter)]
                 } else {
-                    x.huffman
+                    &x.huffman
                 };
 
-                // assert!(next_huffman.1 != 0);
-
-                huffman.0 = (huffman.0.wrapping_shl(next_huffman.1 as u32)) | next_huffman.0;
-                huffman.1 = huffman.1.checked_add(next_huffman.1 as u32).unwrap();
-
-                assert!(huffman.1 >= 63 || huffman.0 < (1usize << huffman.1), "{:?} {:?}", huffman, next_huffman);
+                *huffman = huffman.and_then(|v| v.checked_extend(next_huffman));
 
                 return x.letter;
             }
@@ -554,23 +602,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>>  {
     ];
 
     let length_huffman = {
-        let mut tmp: [Option<(usize, u8)>; 20] = Default::default();
+        let mut tmp: [Option<SmolBitvec>; 20] = Default::default();
 
         let weights_and_symbols_iter = lengths.iter()
             .enumerate()
             .filter(|(_, &count)| count > 0)
             .map(|(length, &count)| (count, length));
 
-        for (code, bits, length) in huffman(weights_and_symbols_iter) {
-            tmp[length] = Some((code, bits));
+        for (code, length) in huffman(weights_and_symbols_iter) {
+            tmp[length] = Some(code);
         }
 
         tmp
     };
 
+    let get_length_huffman = |wordlen: usize| {
+        length_huffman.get(wordlen).and_then(|&x| x)
+    };
+
     let mut huffgood = 0usize;
     let mut huffbad = 0usize;
-    let mut huffmaxbits = 0u32;
+    let mut huffmaxbits = 0u8;
 
     let mut wordbuf = vec![0u8; WORD_SIZE * DISTINCT_WORDS];
     let mut wordbuf_write = &mut wordbuf[..];
@@ -581,8 +633,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>>  {
 
         w.clear();
 
-        let mut huffman = (0usize, 0u32);
-        //let mut eof_huffman = (0usize, 0u32);
+        let mut huffman = Some(SmolBitvec::new());
         let mut huffindex: Option<usize>;
 
         // Add more letters until we find a word that hasn't been accepted yet.
@@ -595,18 +646,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>>  {
 
             w.push(letter);
 
-            huffmaxbits = huffman.1.max(huffmaxbits);
-
-            //markov.next_eof(&w[w.len().saturating_sub(2)..], &huffman, &mut eof_huffman);
-
             huffindex = None;
+            if let Some(huffman) = huffman {
+                huffmaxbits = huffmaxbits.max(huffman.len());
 
+                if let Some(huff_tmp) = get_length_huffman(w.len()).and_then(|l| l.checked_extend(&huffman)) {
+                    if 1usize << huff_tmp.len() <= word_bitvec.len() {
+                        huffindex = Some(huff_tmp.reverse().to_u64() as usize);
+                    }
+                }
+            }
 
             if w.len() == 1 && !VOWELS.contains(&w.as_bytes()[0]) {
                 break;
             }
-
-            assert!(huffman.1 != 0, "wat {:?} {:?}", w, huffman);
 
             // TODO debug the eof-in-huffman code.
             // The reason for wanting a dedicated eof symbol at the end is that it might improve
@@ -616,20 +669,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>>  {
             // least not as well correlated, and it's hard to get a good estimate.
             // NOTE You need to make sure the start of your bitstream is always aligned the same
             //      (i.e. either hi-align it or flip the bit order).
-            if w.len() < length_huffman.len() {
-                if let Some(len_huff) = length_huffman[w.len()] {
-                    if len_huff.1 as u32 + huffman.1 < 64 {
-                        let total_bits = len_huff.1 as u32 + huffman.1;
-                        if 1usize << total_bits <= word_bitvec.len() {
-                            let mut tmp = huffman.0;
-                            tmp = tmp | (len_huff.0).checked_shl(huffman.1).unwrap();
-                            tmp = tmp.reverse_bits() >> (64 - total_bits);
-                            //tmp = tmp << (SET_BITS as u32 - total_bits);
-                            huffindex = Some(tmp);
-                        }
-                    }
-                }
-            }
+
             // if eof_huffman.1 < 63 && (1 << eof_huffman.1) < word_bitvec.len() {
             //     huffindex = Some(eof_huffman.0);
             // }
