@@ -202,69 +202,89 @@ impl WordIndex {
     }
 }
 
-
-// TODO specialize for training and lookup phases
-// TODO use separate huffman tables for word_tail.len() 0 and 1
 #[derive(Default, Debug)]
-struct MarkovNode {
+struct TrainMarkovNode {
+    total: u64,
+    letter: u8,
+    letters: [Option<Box<TrainMarkovNode>>; 26],
+}
+
+impl TrainMarkovNode {
+
+    fn train(&mut self, word: &[u8]) {
+        let mut m = self;
+        m.total += 1;
+        for b in word.bytes() {
+            m = m.letters[byte_to_index(b)].get_or_insert_with(Default::default);
+            m.letter = b;
+            m.total += 1;
+        }
+    }
+
+}
+
+#[derive(Default, Debug)]
+struct LookupMarkovNode {
     total: u64,
     huffman: SmolBitvec,
     letter: u8,
     present: u32,
-    letters: [Option<Box<MarkovNode>>; 26],
-    //eof_huffman: (usize, u8),
+    letters: [Option<Box<LookupMarkovNode>>; 26],
 }
 
-impl MarkovNode {
-    pub fn huffman_letters(&mut self) {
-        assert!(self.present == 0);
+impl LookupMarkovNode {
+    fn from_training(mut training: TrainMarkovNode) -> LookupMarkovNode {
+        let mut tmp = LookupMarkovNode {
+            total: training.total,
+            letter: training.letter,
+            ..Default::default()
+        };
 
-        let node_iter = self.letters.iter_mut()
+        for (a, b) in tmp.letters.iter_mut().zip(training.letters.iter_mut()) {
+            *a = b.take().map(|m| Box::new(Self::from_training(*m)));
+        }
+
+        let node_iter = tmp.letters.iter_mut()
             .flatten()
             .map(|n| (n.total as usize, n));
         for (code, n) in huffman(node_iter) {
             n.huffman = code;
-            n.huffman_letters();
         }
-    }
-
-    pub fn pack(&mut self) {
-        assert!(self.present == 0);
 
         let mut dest_idx = 0;
 
         for i in 0..26 {
             if dest_idx < i {
-                if let Some(mut n) = self.letters[i].take() {
-                    n.pack();
-                    self.letters[dest_idx] = Some(n);
+                if let Some(n) = tmp.letters[i].take() {
+                    tmp.letters[dest_idx] = Some(n);
                     dest_idx += 1;
-                    self.present |= 1 << i;
+                    tmp.present |= 1 << i;
                 }
             }
-            else if let Some(n) = &mut self.letters[i] {
+            else if let Some(_) = &mut tmp.letters[i] {
                 dest_idx += 1;
-                self.present |= 1 << i;
-                n.pack();
+                tmp.present |= 1 << i;
             }
         }
 
-        self.present |= 1<<31;
+        tmp.present |= 1<<31;
+
+        tmp
     }
 
-    fn iter_present(&self) -> impl Iterator<Item=&MarkovNode> {
+    fn iter_present(&self) -> impl Iterator<Item=&LookupMarkovNode> {
         let max = (self.present & ((1 << 26) - 1)).count_ones();
         self.letters[..max as usize].iter().flatten().map(|c| c.as_ref())
     }
 
-    fn index_packed(&self, letter: u8) -> Option<&MarkovNode> {
+    fn index_packed(&self, letter: u8) -> Option<&LookupMarkovNode> {
         assert!(self.present != 0);
 
         let abc_index = byte_to_index(letter);
         let bit = 1 << abc_index;
         if self.present & bit == 0 { return None; }
         let offset = ((bit - 1) & self.present).count_ones();
-        let m: Option<&MarkovNode> = self.letters[offset as usize].as_ref().map(|c| c.as_ref());
+        let m: Option<&LookupMarkovNode> = self.letters[offset as usize].as_ref().map(|c| c.as_ref());
         m
     }
 
@@ -274,40 +294,34 @@ impl MarkovNode {
 fn index_to_byte(i: usize) -> u8 { b'a' + i as u8 }
 fn byte_to_index(b: u8) -> usize { b as usize - b'a' as usize }
 
-struct Markov {
-    root: MarkovNode,
+#[derive(Default)]
+struct MarkovLookup {
+    root: LookupMarkovNode,
     huffman_vowels: [SmolBitvec; 26],
 }
 
-impl Markov {
+impl MarkovLookup {
 
-    fn new() -> Markov {
-        Markov {
-            root: Default::default(),
-            huffman_vowels: Default::default(),
-        }
-    }
-
-    fn huffman_letters(&mut self) {
-        self.root.huffman_letters();
+    fn new(training_root: TrainMarkovNode) -> MarkovLookup {
+        let mut tmp = MarkovLookup {
+            root: LookupMarkovNode::from_training(training_root),
+            ..Default::default()
+        };
 
         // Special huffman table for first character of word, which has only vowels
-        let node_iter = self.root.letters.iter_mut()
+        let node_iter = tmp.root.letters.iter_mut()
             .flatten()
             .filter(|m| VOWELS.contains(&m.letter))
             .map(|n| (n.total as usize, n));
 
         for (code, n) in huffman(node_iter) {
-            self.huffman_vowels[byte_to_index(n.letter)] = code;
+            tmp.huffman_vowels[byte_to_index(n.letter)] = code;
         }
+
+        tmp
     }
 
-    fn pack(&mut self) {
-        self.root.pack();
-    }
-
-
-    fn lookup(&self, word_tail: impl Iterator<Item=u8>) -> Option<&MarkovNode> {
+    fn lookup(&self, word_tail: impl Iterator<Item=u8>) -> Option<&LookupMarkovNode> {
         let mut m = &self.root;
 
         for b in word_tail {
@@ -317,17 +331,6 @@ impl Markov {
 
         Some(m)
     }
-
-    fn train(&mut self, word: &[u8]) {
-        let mut m = &mut self.root;
-        m.total += 1;
-        for b in word.bytes() {
-            m = m.letters[byte_to_index(b)].get_or_insert_with(Default::default);
-            m.letter = b;
-            m.total += 1;
-        }
-    }
-
 
     fn next_letter(&self, word_tail: &[u8], random: &mut PythonRandom, huffman: &mut SmolBitvec) -> u8 {
         // Bug in original implementation:
@@ -361,16 +364,6 @@ impl Markov {
         // never hit with the hardcoded random number generator seed...
         panic!("inconsistent tree");
     }
-
-    // fn next_eof(&self, word_tail: &[u8], huffman: &(usize, u32), eof_huffman: &mut (usize, u32)) {
-
-    //     let x = self.lookup(word_tail.bytes()).unwrap();
-
-    //     eof_huffman.0 = (huffman.0.wrapping_shl(x.eof_huffman.1 as u32)) | x.eof_huffman.0;
-    //     eof_huffman.1 = huffman.1.checked_add(x.eof_huffman.1 as u32).unwrap();
-
-    //     assert!(huffman.1 >= 63 || huffman.0 < (1usize << huffman.1), "{:?} {:?}", huffman, x.eof_huffman);
-    // }
 }
 
 
@@ -583,7 +576,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>>  {
 
     println!("Training Markov chain");
 
-    let mut markov = Markov::new();
+    let mut markov = TrainMarkovNode::default();
 
     for word in all_words {
         let mut word = &word[..];
@@ -593,9 +586,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>>  {
         }
     }
 
-    markov.huffman_letters();
-
-    markov.pack();
+    let markov = MarkovLookup::new(markov);
 
     println!("Generating artificial words");
 
