@@ -1,12 +1,14 @@
+use std::hash::BuildHasher;
+use std::hash::Hasher;
 use std::cmp::Reverse;
-use std::collections::BinaryHeap;
+use std::collections::{HashSet, BinaryHeap};
 use std::cmp::Ordering;
 use std::io::Write;
 use std::fs;
 use encoding_rs::mem::decode_latin1;
 use rand_python::{PythonRandom, MersenneTwister};
 use aho_corasick::AhoCorasickBuilder;
-use std::{fmt::Debug, io, cmp::PartialOrd, convert::TryInto};
+use std::{fmt::Debug, io, cmp::PartialOrd, convert::TryInto, hash::Hash};
 use bitvec::prelude::{bitbox, Lsb0};
 use fnv::FnvHashSet;
 use bstr::{BString, BStr, ByteSlice};
@@ -33,7 +35,7 @@ const WORD_SIZE: usize = 16;
 
 /// Value type that behaves like a vector of bits with max length 64.
 /// Used for representing (sequences of) huffman codes.
-#[derive(Clone, Copy, Default, Debug)]
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq, Hash)]
 struct SmolBitvec {
     used: u8,
     bits: u64,
@@ -77,6 +79,7 @@ impl SmolBitvec {
         self.bits
     }
 }
+
 
 /// Generates huffman codes for a given set of symbols and their corresponding weights.
 ///
@@ -154,6 +157,54 @@ fn huffman<T: Debug>(weights_and_symbols: impl Iterator<Item=(usize, T)>) -> Vec
     codes
 }
 
+const SET_BITS: usize = 32;
+
+/// Set that tracks which "words" we've already generated.
+/// The words are represented in a huffman compressed representation.
+/// By using a small-yet-lossless representation we can store almost all of them by indexing
+/// directly into a bitset, avoiding hash lookups. We're still spending most of our time
+/// waiting for memory, but overall we end up touching less cache lines per lookup, and
+/// use cache a bit more effectively for some very few words that compress to something
+/// *very* small.
+struct WordIndex {
+    bits: Vec<u64>,
+    hash: FnvHashSet::<SmolBitvec>,
+}
+
+impl WordIndex {
+    fn new() -> Self {
+        Self {
+            bits: vec![0, (1 << SET_BITS) / 64],
+            hash: FnvHashSet::with_capacity_and_hasher(0, Default::default())
+        }
+    }
+
+    fn contains(&self, w: &SmolBitvec) -> bool {
+        if (1usize << w.len()) <= (self.bits.len() * 64) {
+            let idx = w.to_u64() / 64;
+            let bit = w.to_u64() % 64;
+            ((self.bits[idx as usize] >> bit) & 1) != 0
+        }
+        else {
+            self.hash.contains(w)
+        }
+    }
+
+    fn insert(&mut self, w: &SmolBitvec) {
+        if (1usize << w.len()) <= (self.bits.len() * 64) {
+            let idx = w.to_u64() / 64;
+            let bit = w.to_u64() % 64;
+            self.bits[idx as usize] |= 1 << bit;
+        }
+        else {
+            self.hash.insert(*w);
+        }
+    }
+}
+
+
+// TODO specialize for training and lookup phases
+// TODO use separate huffman tables for word_tail.len() 0 and 1
 #[derive(Default, Debug)]
 struct MarkovNode {
     total: u64,
@@ -278,7 +329,7 @@ impl Markov {
     }
 
 
-    fn next_letter(&self, word_tail: &[u8], random: &mut PythonRandom, huffman: &mut Option<SmolBitvec>) -> u8 {
+    fn next_letter(&self, word_tail: &[u8], random: &mut PythonRandom, huffman: &mut SmolBitvec) -> u8 {
         // Bug in original implementation:
         // This assumes the letter must be present in the root node.
         // This is not guaranteed to be the case, but with the chosen
@@ -297,7 +348,7 @@ impl Markov {
                     &x.huffman
                 };
 
-                *huffman = huffman.and_then(|v| v.checked_extend(next_huffman));
+                *huffman = huffman.checked_extend(next_huffman).unwrap();
 
                 return x.letter;
             }
@@ -553,13 +604,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>>  {
     let mut random = PythonRandom::new(mt);
     random.seed_u32(RANDOM_SEED);
 
-    let mut word_set = FnvHashSet::<BString>::with_capacity_and_hasher(0, Default::default());
+    let mut word_index = WordIndex::new();
 
-    const SET_BITS: usize = 32;
-
-    let mut word_bitvec = bitbox![Lsb0, u64; 0; 1usize << SET_BITS];
-
-    println!("Using {} megabytes of RAM for word_bitvec", word_bitvec.len() / 8 / 1024 / 1024);
+    // println!("Using {} megabytes of RAM for word_bitvec", word_bitvec.len() / 8 / 1024 / 1024);
 
     // The actual ordered list of words we will use later to pick words based on random numbers.
     // We could use a set that preserves insertion order, but the hash lookups we save by using
@@ -633,8 +680,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>>  {
 
         w.clear();
 
-        let mut huffman = Some(SmolBitvec::new());
-        let mut huffindex: Option<usize>;
+        let mut huffman = SmolBitvec::new();
+        let mut compressed_word = SmolBitvec::new();
 
         // Add more letters until we find a word that hasn't been accepted yet.
         // (Could still be a word that will never be accepted due to later checks.)
@@ -646,16 +693,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>>  {
 
             w.push(letter);
 
-            huffindex = None;
-            if let Some(huffman) = huffman {
-                huffmaxbits = huffmaxbits.max(huffman.len());
-
-                if let Some(huff_tmp) = get_length_huffman(w.len()).and_then(|l| l.checked_extend(&huffman)) {
-                    if 1usize << huff_tmp.len() <= word_bitvec.len() {
-                        huffindex = Some(huff_tmp.reverse().to_u64() as usize);
-                    }
-                }
-            }
+            compressed_word = length_huffman[w.len()].unwrap().checked_extend(&huffman).unwrap().reverse();
 
             if w.len() == 1 && !VOWELS.contains(&w.as_bytes()[0]) {
                 break;
@@ -674,22 +712,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>>  {
             //     huffindex = Some(eof_huffman.0);
             // }
 
-            if huffindex.is_some() {
-                huffgood += 1;
-            } else {
-                huffbad += 1;
-            }
+            // if huffindex.is_some() {
+            //     huffgood += 1;
+            // } else {
+            //     huffbad += 1;
+            // }
 
-            if let Some(huffindex) = huffindex {
-                if !word_bitvec[huffindex] {
-                    //assert!(!word_set.contains(&w), "oops {} {:?} {:?} {}", &w, &huffman, length_huffman[w.len()], huffindex);
-                    break;
-                }
-                //assert!(word_set.contains(&w), "oops {} {:?} {:?} {}", &w, &huffman, length_huffman[w.len()], huffindex);
-            }
-            else {
-                if !word_set.contains(&w) { break; }
-            }
+            if !word_index.contains(&compressed_word) { break; }
         }
 
         // Check for vowels and forbidden words.
@@ -700,12 +729,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>>  {
         // with a vowel. So we can just perform this check on the first letter.
         if VOWELS.contains(&w.as_bytes()[0]) && !forbidden.is_match(&w) {
             // Accepted, so make a note that we've seen this word now.
-            if let Some(huffindex) = huffindex {
-                word_bitvec.set(huffindex, true);
-                //word_set.insert(w.clone());
-            } else {
-                word_set.insert(w.clone());
-            }
+            word_index.insert(&compressed_word);
 
             if w.len() > 8 {
                 seen_above_8 += 1;
@@ -733,7 +757,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>>  {
     // }
     // dbg!(lengths);
 
-    drop(word_bitvec);
+    drop(word_index);
     //drop(word_set);
 
     println!("Capitalizing some words");
