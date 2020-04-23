@@ -169,34 +169,42 @@ const SET_BITS: usize = 32;
 struct WordIndex {
     bits: Vec<u64>,
     hash: FnvHashSet::<SmolBitvec>,
+    bit_lookups: u64,
+    hash_lookups: u64,
 }
 
 impl WordIndex {
     fn new() -> Self {
         Self {
-            bits: vec![0, (1 << SET_BITS) / 64],
-            hash: FnvHashSet::with_capacity_and_hasher(0, Default::default())
+            bits: vec![0; (1 << SET_BITS) / 64],
+            hash: FnvHashSet::with_capacity_and_hasher(0, Default::default()),
+            bit_lookups: 0,
+            hash_lookups: 0,
         }
     }
 
-    fn contains(&self, w: &SmolBitvec) -> bool {
+    fn contains(&mut self, w: &SmolBitvec) -> bool {
         if (1usize << w.len()) <= (self.bits.len() * 64) {
+            self.bit_lookups += 1;
             let idx = w.to_u64() / 64;
             let bit = w.to_u64() % 64;
             ((self.bits[idx as usize] >> bit) & 1) != 0
         }
         else {
+            self.hash_lookups += 1;
             self.hash.contains(w)
         }
     }
 
     fn insert(&mut self, w: &SmolBitvec) {
         if (1usize << w.len()) <= (self.bits.len() * 64) {
+            self.bit_lookups += 1;
             let idx = w.to_u64() / 64;
             let bit = w.to_u64() % 64;
             self.bits[idx as usize] |= 1 << bit;
         }
         else {
+            self.hash_lookups += 1;
             self.hash.insert(*w);
         }
     }
@@ -646,6 +654,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>>  {
             .enumerate()
             .filter(|(_, &count)| count > 0)
             .map(|(length, &count)| (count, length));
+            //.map(|(length, &count)| (lengths[..=length].iter().sum(), length));
 
         for (code, length) in huffman(weights_and_symbols_iter) {
             tmp[length] = Some(code);
@@ -658,8 +667,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>>  {
         length_huffman.get(wordlen).and_then(|&x| x)
     };
 
-    let mut huffgood = 0usize;
-    let mut huffbad = 0usize;
     let mut huffmaxbits = 0u8;
 
     let mut wordbuf = vec![0u8; WORD_SIZE * DISTINCT_WORDS];
@@ -685,6 +692,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>>  {
             w.push(letter);
 
             compressed_word = length_huffman[w.len()].unwrap().checked_extend(&huffman).unwrap().reverse();
+            huffmaxbits = huffmaxbits.max(compressed_word.len());
 
             if w.len() == 1 && !VOWELS.contains(&w.as_bytes()[0]) {
                 break;
@@ -740,7 +748,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>>  {
 
     drop(wordbuf_write);
 
-    println!("{} out of {} lookups used the word_bitvec, {} didn't, longest huffman encoded word (sans length) was {} bits", huffgood, huffgood + huffbad, huffbad, huffmaxbits);
+    println!("{} out of {} lookups used the word_bitvec, {} didn't, longest huffman encoded word (including length) was {} bits", word_index.bit_lookups, word_index.bit_lookups + word_index.hash_lookups, word_index.hash_lookups, huffmaxbits);
 
     // let mut lengths = [0usize; 20];
     // for w in &word_list {
