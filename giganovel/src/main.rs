@@ -48,6 +48,10 @@ impl SmolBitvec {
         self.used
     }
 
+    fn mask(&self) -> u64 {
+        u64::MAX >> (64 - self.used)
+    }
+
     fn checked_extend(&self, other: &SmolBitvec) -> Option<Self> {
         if self.used + other.used > 64  {
             return None;
@@ -184,7 +188,7 @@ impl WordIndex {
     }
 
     fn contains(&mut self, w: &SmolBitvec) -> bool {
-        if (1usize << w.len()) <= (self.bits.len() * 64) {
+        if (w.mask() as usize) < self.bits.len() * 64 {
             self.bit_lookups += 1;
             let idx = w.to_u64() / 64;
             let bit = w.to_u64() % 64;
@@ -197,7 +201,7 @@ impl WordIndex {
     }
 
     fn insert(&mut self, w: &SmolBitvec) {
-        if (1usize << w.len()) <= (self.bits.len() * 64) {
+        if (w.mask() as usize) < self.bits.len() * 64 {
             self.bit_lookups += 1;
             let idx = w.to_u64() / 64;
             let bit = w.to_u64() % 64;
