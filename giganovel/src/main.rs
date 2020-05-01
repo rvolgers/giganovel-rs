@@ -333,10 +333,10 @@ impl MarkovLookup {
         tmp
     }
 
-    fn lookup(&self, word_tail: impl Iterator<Item=u8>) -> Option<&LookupMarkovNode> {
+    fn lookup(&self, word_tail: &[u8]) -> Option<&LookupMarkovNode> {
         let mut m = &self.root;
 
-        for b in word_tail {
+        for &b in word_tail {
             m = m.index_packed(b)
                 .or_else(|| self.root.index_packed(b))?;
         }
@@ -349,7 +349,7 @@ impl MarkovLookup {
         // This assumes the letter must be present in the root node.
         // This is not guaranteed to be the case, but with the chosen
         // random seed the unwrap() happens to never fail.
-        let m = self.lookup(word_tail.bytes()).unwrap();
+        let m = self.lookup(word_tail).unwrap();
 
         assert!(m.total > 0);
         let mut num = random.randint(0, m.total - 1);
