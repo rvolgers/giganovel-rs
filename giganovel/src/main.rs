@@ -34,6 +34,14 @@ lazy_static! {
         .build(FORBIDDEN);
 }
 
+
+// Helper for converting b'a'..=b'z' => 0..=25
+fn byte_to_index(b: u8) -> usize { b as usize - b'a' as usize }
+
+// Helper for converting b'a'..=b'z' => 2**0..=2**25
+fn byte_to_bit(b: u8) -> u32 { 1 << byte_to_index(b) }
+
+
 // Used to store the generated words.
 // Storing them inline instead of as boxed strings saves a lot of memory traffic.
 // Since the longest word generated is 16 bytes, we need to get a little creative
@@ -82,19 +90,15 @@ struct LetterDict<V: Default> {
 }
 
 impl<V: Default> LetterDict<V> {
-    fn bit(letter: u8) -> u32 {
-        1u32 << byte_to_index(letter)
-    }
-
     fn rank(&self, letter: u8) -> usize {
-        let mask = Self::bit(letter) - 1;
+        let mask = byte_to_bit(letter) - 1;
         (self.bits & mask).count_ones() as usize
     }
 
     fn insert(&mut self, letter: u8, value: V) -> &mut V {
         let idx = self.rank(letter);
-        assert!(self.bits & Self::bit(letter) == 0);
-        self.bits |= Self::bit(letter);
+        assert!(self.bits & byte_to_bit(letter) == 0);
+        self.bits |= byte_to_bit(letter);
         self.values.insert(idx, value);
         &mut self.values[idx]
     }
@@ -102,7 +106,7 @@ impl<V: Default> LetterDict<V> {
     fn get_or_insert_with<F>(&mut self, letter: u8, f: F) -> &mut V
         where F: FnOnce() -> V
     {
-        if self.bits & Self::bit(letter) != 0 {
+        if self.bits & byte_to_bit(letter) != 0 {
             let idx = self.rank(letter);
             &mut self.values[idx]
         } else {
@@ -115,7 +119,7 @@ impl<V: Default> LetterDict<V> {
     }
 
     fn get(&self, letter: u8) -> Option<&V> {
-        if self.bits & Self::bit(letter) != 0 {
+        if self.bits & byte_to_bit(letter) != 0 {
             Some(&self.values[self.rank(letter)])
         } else {
             None
@@ -146,23 +150,19 @@ impl WordTreeNode {
     }
 
     fn is_rejected(&self, letter: u8) -> bool {
-        let bit = 1 << byte_to_index(letter);
-        self.rejected & bit != 0
+        self.rejected & byte_to_bit(letter) != 0
     }
 
     fn is_accepted(&self, letter: u8) -> bool {
-        let bit = 1 << byte_to_index(letter);
-        self.accepted & bit != 0
+        self.accepted & byte_to_bit(letter) != 0
     }
 
     fn set_rejected(&mut self, letter: u8) {
-        let bit = 1 << byte_to_index(letter);
-        self.rejected |= bit;
+        self.rejected |= byte_to_bit(letter);
     }
 
     fn set_accepted(&mut self, letter: u8) {
-        let bit = 1 << byte_to_index(letter);
-        self.accepted |= bit;
+        self.accepted |= byte_to_bit(letter);
     }
 }
 
@@ -194,51 +194,33 @@ impl MarkovNode {
     }
 }
 
-// Helper for converting b'a'..b'z' => 0..26
-fn byte_to_index(b: u8) -> usize { b as usize - b'a' as usize }
+fn next_letter(root: &MarkovNode, word_tail: &[u8], random: &mut PythonRandom) -> u8 {
 
-#[derive(Default)]
-struct MarkovLookup {
-    root: MarkovNode,
-}
-
-impl MarkovLookup {
-
-    fn new(root: MarkovNode) -> Self {
-        MarkovLookup {
-            root,
-        }
+    // Bug in original implementation:
+    // This assumes the letter must be present in the root node.
+    // This is not guaranteed to be the case, but with the chosen
+    // random seed the unwrap() happens to never fail.
+    let mut m = root;
+    for &b in word_tail {
+        m = m.lookup(b).or_else(|| root.lookup(b)).unwrap();
     }
 
-    fn next_letter(&self, word_tail: &[u8], random: &mut PythonRandom) -> u8 {
+    assert!(m.total > 0);
+    let mut num = random.randint(0, m.total - 1);
 
-        // Bug in original implementation:
-        // This assumes the letter must be present in the root node.
-        // This is not guaranteed to be the case, but with the chosen
-        // random seed the unwrap() happens to never fail.
-        let mut m = &self.root;
-        for &b in word_tail {
-            m = m.lookup(b).or_else(|| self.root.lookup(b)).unwrap();
+    for x in m.iter_present() {
+        if x.total > num {
+            return x.letter
         }
-
-        assert!(m.total > 0);
-        let mut num = random.randint(0, m.total - 1);
-
-        for x in m.iter_present() {
-            if x.total > num {
-                return x.letter
-            }
-            num -= x.total;
-        }
-
-        // Bug in original implementation:
-        // Totals of children do not sum to the total of the parent, but the
-        // code above assumes it does. This is definitely a bug, but it's just
-        // never hit with the hardcoded random number generator seed...
-        panic!("inconsistent tree");
+        num -= x.total;
     }
-}
 
+    // Bug in original implementation:
+    // Totals of children do not sum to the total of the parent, but the
+    // code above assumes it does. This is definitely a bug, but it's just
+    // never hit with the hardcoded random number generator seed...
+    panic!("inconsistent tree");
+}
 
 struct Book {
     title: BString,
@@ -453,8 +435,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>>  {
         }
     }
 
-    let markov = MarkovLookup::new(markov);
-
     println!("Generating artificial words");
 
     // Initialize python-compatible RNG
@@ -476,20 +456,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>>  {
         let mut letter;
 
         loop {
-            // Add a new letter to the word and update the word_set_short index.
-
             let word_tail = &word[word.len().saturating_sub(2)..];
 
-            letter = markov.next_letter(&word_tail, &mut random);
+            letter = next_letter(&markov, &word_tail, &mut random);
 
             word.push(letter);
 
-            if !word_tree_node.is_accepted(letter) { break; }
+            if !word_tree_node.is_accepted(letter) {
+                break;
+            }
 
             word_tree_node = word_tree_node.lookup(letter);
         }
 
-        if word_tree_node.is_rejected(letter) { continue; }
+        if word_tree_node.is_rejected(letter) {
+            continue;
+        }
 
         if !VOWELS.contains(&word[0]) || FORBIDDEN_MATCHER.is_match(&word) {
             word_tree_node.set_rejected(letter);
