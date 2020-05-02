@@ -6,8 +6,7 @@ use std::fs;
 use encoding_rs::mem::decode_latin1;
 use rand_python::{PythonRandom, MersenneTwister};
 use aho_corasick::{AhoCorasick, AhoCorasickBuilder};
-use std::{fmt::Debug, io};
-use fnv::FnvHashSet;
+use std::{fmt::Debug, io, collections::HashSet};
 use bstr::{BString, BStr, ByteSlice};
 use lazy_static::lazy_static;
 
@@ -396,7 +395,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>>  {
     println!("Getting reference words");
 
     // Order is not important here, so ensure uniqueness by collecting into a set.
-    let all_words: FnvHashSet<&[u8]> = slice.as_bytes()
+    let all_words: HashSet<&[u8]> = slice.as_bytes()
         .fields_with(|b| !b.is_ascii_lowercase())
         .collect();
 
@@ -436,8 +435,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>>  {
         w.clear();
         let mut word_tree_node = &mut word_tree_root;
 
-        // Add more letters until we find a word that hasn't been accepted yet.
-        // (Could still be a word that will never be accepted due to later checks.)
         loop {
             // Add a new letter to the word and update the word_set_short index.
 

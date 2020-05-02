@@ -14,7 +14,5 @@ debug = true
 rand-python = { path = "../rand-python" }
 encoding_rs = "0.8.22"
 aho-corasick = "0.7.9"
-fnv = "1.0.6"
-bitvec = "0.17.2"
 bstr = "0.2.11"
 lazy_static = "1.4.0"
