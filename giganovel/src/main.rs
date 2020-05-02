@@ -212,7 +212,7 @@ impl MarkovNode {
     }
 }
 
-fn train(root: &mut MarkovNode, ngram: &[u8]) {
+fn train_markov(root: &mut MarkovNode, ngram: &[u8]) {
     let mut m = root;
     m.total += 1;
     for &b in ngram {
@@ -461,7 +461,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>>  {
 
     for word in all_words {
         for trigram in word.windows(3) {
-            train(&mut markov, trigram);
+            train_markov(&mut markov, trigram);
         }
     }
 
