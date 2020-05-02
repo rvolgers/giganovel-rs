@@ -75,6 +75,64 @@ impl DerefMut for ShortWord {
     }
 }
 
+#[derive(Default, Debug, Clone)]
+struct LetterDict<V: Default> {
+    bits: u32,
+    values: ArrayVec::<[V; 26]>,
+}
+
+impl<V: Default> LetterDict<V> {
+    fn bit(letter: u8) -> u32 {
+        1u32 << byte_to_index(letter)
+    }
+
+    fn rank(&self, letter: u8) -> usize {
+        let mask = Self::bit(letter) - 1;
+        (self.bits & mask).count_ones() as usize
+    }
+
+    fn insert(&mut self, letter: u8, value: V) -> &mut V {
+        let idx = self.rank(letter);
+        assert!(self.bits & Self::bit(letter) == 0);
+        self.bits |= Self::bit(letter);
+        self.values.insert(idx, value);
+        &mut self.values[idx]
+    }
+
+    fn get_or_insert_with<F>(&mut self, letter: u8, f: F) -> &mut V
+        where F: FnOnce() -> V
+    {
+        if self.bits & Self::bit(letter) != 0 {
+            let idx = self.rank(letter);
+            &mut self.values[idx]
+        } else {
+            self.insert(letter, f())
+        }
+    }
+
+    fn iter_values(&self) -> impl Iterator<Item=&V> {
+        self.values.iter()
+    }
+
+    fn get(&self, letter: u8) -> Option<&V> {
+        if self.bits & Self::bit(letter) != 0 {
+            Some(&self.values[self.rank(letter)])
+        } else {
+            None
+        }
+    }
+
+    fn get_mut(&mut self, letter: u8) -> Option<&mut V> {
+        if self.bits & Self::bit(letter) != 0 {
+            let idx = self.rank(letter);
+            Some(&mut self.values[idx])
+        } else {
+            None
+        }
+    }
+}
+
+
 // Used to store the set of words we have seen.
 // accepted and rejected are bitmasks.
 // if a word has not been accepted or rejected, it is tested against the rules for words and
@@ -88,7 +146,7 @@ impl DerefMut for ShortWord {
 struct WordTreeNode {
     accepted: u32,
     rejected: u32,
-    next: [Option<Box<Self>>; 26],
+    next: LetterDict<Box<Self>>,
 }
 
 enum LookupResult<'a> {
@@ -99,10 +157,10 @@ enum LookupResult<'a> {
 
 impl WordTreeNode {
     fn lookup(&mut self, word: &[u8]) -> LookupResult {
-        let index = byte_to_index(word[word.len() - 1]);
-        let bit = 1 << index;
+        let letter = word[word.len() - 1];
+        let bit = 1 << byte_to_index(letter);
         if self.accepted & bit != 0 {
-            LookupResult::Exists(self.next[index as usize].get_or_insert_with(Default::default).as_mut())
+            LookupResult::Exists(self.next.get_or_insert_with(letter, Default::default).as_mut())
         } else if self.rejected & bit != 0 {
             LookupResult::Rejected
         } else if VOWELS.contains(&word[0]) && !FORBIDDEN_MATCHER.is_match(&word) {
@@ -116,72 +174,33 @@ impl WordTreeNode {
 }
 
 #[derive(Default, Debug)]
-struct TrainMarkovNode {
+struct MarkovNode {
     total: u64,
     letter: u8,
-    letters: [Option<Box<Self>>; 26],
+    letters: LetterDict<Box<Self>>,
 }
 
-impl TrainMarkovNode {
+impl MarkovNode {
 
     fn train(&mut self, word: &[u8]) {
         let mut m = self;
         m.total += 1;
         for b in word.bytes() {
-            m = m.letters[byte_to_index(b)].get_or_insert_with(Default::default);
+            m = m.letters.get_or_insert_with(b, Default::default);
             m.letter = b;
             m.total += 1;
         }
     }
 
-}
-
-#[derive(Default, Debug)]
-struct LookupMarkovNode {
-    total: u64,
-    letter: u8,
-    present: u32,  // bitmask specifying which letters are present
-    letters: ArrayVec::<[Box<Self>; 26]>,  // packed array containing only present letters
-}
-
-impl LookupMarkovNode {
-    fn bit(letter: u8) -> u32 {
-        1u32 << byte_to_index(letter)
-    }
-
-    fn rank(&self, letter: u8) -> usize {
-        let mask = Self::bit(letter) - 1;
-        (self.present & mask).count_ones() as usize
-    }
-
-    fn from_training(training: &TrainMarkovNode) -> Self {
-        Self {
-            total: training.total,
-            letter: training.letter,
-            present: training.letters.iter()
-                .map(|n| if let Some(n) = n { Self::bit(n.letter) } else { 0 })
-                .sum(),
-            letters: training.letters.iter()
-                .flatten()
-                .map(|n| Box::new(Self::from_training(n)))
-                .collect(),
-        }
+    fn lookup(&self, letter: u8) -> Option<&Self> {
+        self.letters.get(letter).map(|v| &**v)
     }
 
     fn iter_present(&self) -> impl Iterator<Item=&Self> {
-        assert!(self.letters.len() == self.present.count_ones() as usize);
-        self.letters.iter().map(|x| &**x)
+        self.letters.iter_values().map(|v| & **v)
     }
-
-    fn lookup(&self, letter: u8) -> Option<&Self> {
-        if self.present & Self::bit(letter) != 0 {
-            Some(&*self.letters[self.rank(letter)])
-        } else {
-            None
-        }
-    }
-
 }
+
 
 // Helpers for indexing into MarkovNode.letters
 fn index_to_byte(i: usize) -> u8 { b'a' + i as u8 }
@@ -189,14 +208,14 @@ fn byte_to_index(b: u8) -> usize { b as usize - b'a' as usize }
 
 #[derive(Default)]
 struct MarkovLookup {
-    root: LookupMarkovNode,
+    root: MarkovNode,
 }
 
 impl MarkovLookup {
 
-    fn new(training_root: TrainMarkovNode) -> Self {
+    fn new(root: MarkovNode) -> Self {
         MarkovLookup {
-            root: LookupMarkovNode::from_training(&training_root),
+            root,
         }
     }
 
@@ -433,7 +452,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>>  {
 
     println!("Training Markov chain");
 
-    let mut markov = TrainMarkovNode::default();
+    let mut markov = MarkovNode::default();
 
     for word in all_words {
         let mut word = &word[..];
