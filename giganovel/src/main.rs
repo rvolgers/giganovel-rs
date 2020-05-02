@@ -414,6 +414,8 @@ impl Book {
             write.write_all(b"\n")?;
         }
 
+        write.flush()?;
+
         Ok(())
     }
 
@@ -542,8 +544,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>>  {
 
     // Random number generation has been moved to next_word() so it can directly use the generated id
     // to maintain a count of how often each word was produced instead of needing a separate hashmap.
+    // Progress reporting was added to this phase; the original script does not have it.
+    let mut last_mb = 0usize;
     while book.len() < BOOK_SIZE {
         book.next_word(&mut random, &mut writer)?;
+        if book.len() > (last_mb + 10) * 1024 * 1024 {
+            last_mb += 10;
+            println!("{}MiB generated", last_mb);
+        }
     }
     book.end(&mut writer)?;
 
