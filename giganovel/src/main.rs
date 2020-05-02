@@ -6,7 +6,7 @@ use std::fs;
 use encoding_rs::mem::decode_latin1;
 use rand_python::{PythonRandom, MersenneTwister};
 use aho_corasick::{AhoCorasick, AhoCorasickBuilder};
-use std::{fmt::Debug, io, collections::HashSet};
+use std::{fmt::Debug, io, collections::HashSet, ops::{DerefMut, Deref}};
 use bstr::{BString, BStr, ByteSlice};
 use arrayvec::ArrayVec;
 
@@ -34,7 +34,55 @@ lazy_static! {
         .build(FORBIDDEN);
 }
 
-const WORD_SIZE: usize = 16;
+// Used to store the generated words.
+// Storing them inline instead of as boxed strings saves a lot of memory traffic.
+// Since the longest word generated is 16 bytes, we need to get a little creative
+// to store it efficiently while maintaining both good alignment and a fixed size.
+// Basically we store them padded with '\0' bytes, which cannot occur in generated
+// words, and determine the length based on that when we need it.
+#[derive(Default, Copy, Clone, Debug)]
+struct ShortWord {
+    data: [u8; 16],
+}
+
+impl ShortWord {
+    fn len(&self) -> usize {
+        // wacky micro optimization. this does the same as the following line.
+        // self.data.iter().position(|&b| b == 0).unwrap_or(16)
+        16 - (u128::from_le_bytes(self.data).leading_zeros() / 8) as usize
+    }
+}
+
+impl From<&[u8]> for ShortWord {
+    fn from(src: &[u8]) -> Self {
+        let mut data = [0u8; 16];
+        data[..src.len()].copy_from_slice(src);
+        Self { data }
+    }
+}
+
+impl Deref for ShortWord {
+    type Target=[u8];
+    fn deref(&self) -> &Self::Target {
+        &self.data[..ShortWord::len(self)]
+    }
+}
+
+impl DerefMut for ShortWord {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        let len = ShortWord::len(self);
+        &mut self.data[..len]
+    }
+}
+
+// Used to store the set of words we have seen.
+// accepted and rejected are bitmasks.
+// if a word has not been accepted or rejected, it is tested against the rules for words and
+// the bitmasks are updated accordingly.
+// once a word is rejected, it is is rejected forever.
+// once a word is accepted, the next time Exists will be returned for that word and the next level in
+// the tree for that letter will be initialized and returned, since we will keep building our word
+// and need somewhere to put the next letter.
 
 #[derive(Default)]
 struct WordTreeNode {
@@ -92,9 +140,8 @@ impl TrainMarkovNode {
 struct LookupMarkovNode {
     total: u64,
     letter: u8,
-    present: u32,
-    letters: ArrayVec::<[Box<Self>; 26]>,
-    //letters: [Option<Box<Self>>; 26],
+    present: u32,  // bitmask specifying which letters are present
+    letters: ArrayVec::<[Box<Self>; 26]>,  // packed array containing only present letters
 }
 
 impl LookupMarkovNode {
@@ -111,8 +158,13 @@ impl LookupMarkovNode {
         Self {
             total: training.total,
             letter: training.letter,
-            present: training.letters.iter().map(|n| if let Some(n) = n { Self::bit(n.letter) } else { 0 }).sum(),
-            letters: training.letters.iter().flatten().map(|n| Box::new(Self::from_training(n))).collect(),
+            present: training.letters.iter()
+                .map(|n| if let Some(n) = n { Self::bit(n.letter) } else { 0 })
+                .sum(),
+            letters: training.letters.iter()
+                .flatten()
+                .map(|n| Box::new(Self::from_training(n)))
+                .collect(),
         }
     }
 
@@ -148,23 +200,16 @@ impl MarkovLookup {
         }
     }
 
-    fn lookup(&self, word_tail: &[u8]) -> Option<&LookupMarkovNode> {
-        let mut m = &self.root;
-
-        for &b in word_tail {
-            m = m.lookup(b).or_else(|| self.root.lookup(b))?;
-        }
-
-        Some(m)
-    }
-
     fn next_letter(&self, word_tail: &[u8], random: &mut PythonRandom) -> u8 {
 
         // Bug in original implementation:
         // This assumes the letter must be present in the root node.
         // This is not guaranteed to be the case, but with the chosen
         // random seed the unwrap() happens to never fail.
-        let m = self.lookup(word_tail).unwrap();
+        let mut m = &self.root;
+        for &b in word_tail {
+            m = m.lookup(b).or_else(|| self.root.lookup(b)).unwrap();
+        }
 
         assert!(m.total > 0);
         let mut num = random.randint(0, m.total - 1);
@@ -185,7 +230,7 @@ impl MarkovLookup {
 }
 
 
-struct Book<'a> {
+struct Book {
     title: BString,
     author: BString,
     year: BString,
@@ -194,12 +239,12 @@ struct Book<'a> {
     front: bool,
     capitalize: bool,
     counter: Vec<usize>,
-    words: &'a [u8],
+    words: Vec<ShortWord>,
     length: usize,
 }
 
-impl Book<'_> {
-    fn new<'a>(words: &'a [u8]) -> Book<'a> {
+impl Book {
+    fn new<'a>(words: Vec<ShortWord>) -> Book {
         Book {
             title: Default::default(),
             author: Default::default(),
@@ -232,22 +277,21 @@ impl Book<'_> {
         Ok(())
     }
 
-    fn next_word<W: Write>(&mut self, random: &mut PythonRandom, write: &mut W) -> io::Result<()> {
-        // Pick a random word. This was moved to next_word so we can use the
-        // generated index to count how often each word is used without needing
-        // a separate hash lookup to get the count for a word.
-        let mut word;
+    fn next_word_index(&self, random: &mut PythonRandom) -> usize {
         loop {
             let i = random.expovariate(LAMBDA) as usize;
-            if i < self.words.len() / WORD_SIZE {
-                word = &self.words[i * WORD_SIZE .. (i+1) * WORD_SIZE];
-                while word.len() > 0 && word[word.len()-1] == b'\0' {
-                    word = &word[..word.len() - 1];
-                }
-                self.counter[i] += 1;
-                break;
-            }
+            if i < self.words.len() { return i }
         }
+    }
+
+    fn next_word<W: Write>(&mut self, random: &mut PythonRandom, write: &mut W) -> io::Result<()> {
+        // Pick a random word. This was moved to this type so we can use the
+        // generated index to count how often each word is used without needing
+        // a separate hash lookup to get the count for a word.
+        let i = self.next_word_index(random);
+        self.counter[i] += 1;
+
+        let word = self.words[i];
 
         let mut punctuation: Option<u8> = None;
 
@@ -338,7 +382,7 @@ impl Book<'_> {
         writeln!(write, "{}.", &self.line.trim_end().as_bstr())?;
 
         let mut tmp = self.counter.iter()
-            .zip(self.words.chunks(WORD_SIZE))
+            .zip(&self.words)
             .collect::<Vec<_>>();
 
         tmp.sort_by_key(|&(c, _)| c);
@@ -346,10 +390,6 @@ impl Book<'_> {
         writeln!(write, "\n--\n\n\n\n\n\n\nMost common words:")?;
 
         for (_, word) in tmp.iter().rev().take(10) {
-            let mut word: &[u8] = &word[..];
-            while word.len() > 0 && word[word.len()-1] == b'\0' {
-                word = &word[..word.len() - 1];
-            }
             write.write_all(b"- ")?;
             write.write_all(word)?;
             write.write_all(b"\n")?;
@@ -415,36 +455,39 @@ fn main() -> Result<(), Box<dyn std::error::Error>>  {
     let mut word_tree_root = WordTreeNode::default();
 
     // String that holds the current word.
-    let mut w = BString::from("");
+    let mut word = BString::from("");
 
-    let mut wordbuf = vec![0u8; WORD_SIZE * DISTINCT_WORDS];
-    let mut wordbuf_write = &mut wordbuf[..];
+    let mut word_list: Vec<ShortWord> = Vec::with_capacity(DISTINCT_WORDS);
 
-    while wordbuf_write.len() > 0 {
+    while word_list.len() != DISTINCT_WORDS {
 
-        w.clear();
+        word.clear();
         let mut word_tree_node = &mut word_tree_root;
 
         loop {
             // Add a new letter to the word and update the word_set_short index.
 
-            let word_tail = &w[w.len().saturating_sub(2)..];
+            let word_tail = &word[word.len().saturating_sub(2)..];
 
             let letter = markov.next_letter(&word_tail, &mut random);
 
-            w.push(letter);
+            word.push(letter);
 
-            word_tree_node = match word_tree_node.lookup(&w) {
+            word_tree_node = match word_tree_node.lookup(&word) {
                 LookupResult::Exists(x) => x,
                 LookupResult::Rejected => break,
                 LookupResult::Accepted => {
-                    let (head, tail) = wordbuf_write.split_at_mut(WORD_SIZE);
-                    wordbuf_write = tail;
-                    head[..w.len()].copy_from_slice(&w);
+                    // let (head, tail) = wordbuf_write.split_at_mut(WORD_SIZE);
+                    // wordbuf_write = tail;
+                    // head[..w.len()].copy_from_slice(&w);
+
+                    word_list.push(ShortWord::from(&word[..]));
 
                     // Progress report.
-                    if (DISTINCT_WORDS - (wordbuf_write.len() / WORD_SIZE)) % 100000 == 0 {
-                        println!("{} words generated", DISTINCT_WORDS - (wordbuf_write.len() / WORD_SIZE));
+                    //if (DISTINCT_WORDS - (wordbuf_write.len() / WORD_SIZE)) % 100000 == 0 {
+                    if word_list.len() % 100000 == 0 {
+                        //println!("{} words generated", DISTINCT_WORDS - (wordbuf_write.len() / WORD_SIZE));
+                        println!("{} words generated", word_list.len());
                     }
 
                     break
@@ -455,13 +498,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>>  {
 
     }
 
-    drop(wordbuf_write);
+    // Leak memory because it's faster O:)
+    std::mem::forget(word_tree_root);
 
     println!("Capitalizing some words");
 
     for i in 0..DISTINCT_WORDS {
         if random.randint(0, 100) == 0 {
-            wordbuf[i * WORD_SIZE..i * WORD_SIZE + 1].make_ascii_uppercase();
+            word_list[i][0].make_ascii_uppercase();
         }
     }
 
@@ -470,7 +514,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>>  {
     let writer = fs::File::create("giganovel.txt").unwrap();
     let mut writer = io::BufWriter::with_capacity(1024 * 1024 * 4, writer);
 
-    let mut book = Book::new(&wordbuf);
+    let mut book = Book::new(word_list);
 
     // Random number generation has been moved to next_word() so it can directly use the generated id
     // to maintain a count of how often each word was produced instead of needing a separate hashmap.
