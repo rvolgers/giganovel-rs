@@ -7,7 +7,7 @@ use encoding_rs::mem::decode_latin1;
 use rand_python::{PythonRandom, MersenneTwister};
 use aho_corasick::{AhoCorasick, AhoCorasickBuilder};
 use std::{fmt::Debug, io, collections::HashSet, ops::{DerefMut, Deref}};
-use bstr::{BString, BStr, ByteSlice};
+use bstr::{BString, ByteSlice};
 use arrayvec::ArrayVec;
 
 use lazy_static::lazy_static;
@@ -117,15 +117,6 @@ impl<V: Default> LetterDict<V> {
     fn get(&self, letter: u8) -> Option<&V> {
         if self.bits & Self::bit(letter) != 0 {
             Some(&self.values[self.rank(letter)])
-        } else {
-            None
-        }
-    }
-
-    fn get_mut(&mut self, letter: u8) -> Option<&mut V> {
-        if self.bits & Self::bit(letter) != 0 {
-            let idx = self.rank(letter);
-            Some(&mut self.values[idx])
         } else {
             None
         }
