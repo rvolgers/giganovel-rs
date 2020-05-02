@@ -1,5 +1,20 @@
-
-
+// This is a rust port of "giganovel.py" (original description is included below.)
+// I optimized the data structures a bit but the main logic is just about identical.
+// The original takes about half and hour vs a little over 20 seconds for this version.
+// (The generated file is of course byte-identical, that's the point of the program.)
+//
+// Original comments from giganovel.py:
+// ---
+// A script to generate text files that look like a novel in TXT form.
+// Words are completely made up, but vaguely resemble the Finnish language.
+// The resulting text uses ASCII encoding with only printable characters.
+// Distribution of words follows Zipf's law.
+//
+// Standard parameters generate 1 GB text with 148391 distinct words.
+//
+// Used to benchmark solutions of the Bentley's k most frequent words problem:
+//     https://codegolf.stackexchange.com/q/188133/
+// ---
 
 use std::io::Write;
 use std::fs;
@@ -47,8 +62,10 @@ fn byte_to_bit(b: u8) -> u32 { 1 << byte_to_index(b) }
 // Since the longest word generated is 16 bytes, we need to get a little creative
 // to store it efficiently while maintaining both good alignment and a fixed size.
 // Basically we store them padded with '\0' bytes, which cannot occur in generated
-// words, and determine the length based on that when we need it.
+// words, and determine the length based on that when we need it. Reminds me of
+// strncpy in C :)
 #[derive(Default, Copy, Clone, Debug)]
+#[repr(align(16))]
 struct ShortWord {
     data: [u8; 16],
 }
@@ -81,13 +98,18 @@ impl DerefMut for ShortWord {
     }
 }
 
+// Packed map from a key b'a'..b'z' to a generic value.
+// The main benefit of this over [Option<V>; 26] is that it puts more relevant
+// data (i.e. not None values) in the first cache line of a structure.
+// Since many nodes are quite sparse this means we spend less time waiting for
+// memory for no reason.
 #[derive(Default, Debug, Clone)]
-struct LetterDict<V: Default> {
+struct LetterMap<V: Default> {
     bits: u32,
     values: ArrayVec::<[V; 26]>,
 }
 
-impl<V: Default> LetterDict<V> {
+impl<V: Default> LetterMap<V> {
     fn rank(&self, letter: u8) -> usize {
         let mask = byte_to_bit(letter) - 1;
         (self.bits & mask).count_ones() as usize
@@ -95,7 +117,7 @@ impl<V: Default> LetterDict<V> {
 
     fn insert(&mut self, letter: u8, value: V) -> &mut V {
         let idx = self.rank(letter);
-        assert!(self.bits & byte_to_bit(letter) == 0);
+        debug_assert!(self.bits & byte_to_bit(letter) == 0);
         self.bits |= byte_to_bit(letter);
         self.values.insert(idx, value);
         &mut self.values[idx]
@@ -125,25 +147,25 @@ impl<V: Default> LetterDict<V> {
     }
 }
 
-
-// Used to store the set of words we have seen.
-// accepted and rejected are bitmasks.
-// if a word has not been accepted or rejected, it is tested against the rules for words and
-// the bitmasks are updated accordingly.
-// once a word is rejected, it is is rejected forever.
-// once a word is accepted, the next time Exists will be returned for that word and the next level in
-// the tree for that letter will be initialized and returned, since we will keep building our word
-// and need somewhere to put the next letter.
-
+// Used to keep track of the set of words we have seen so far.
+// Words are built letter by letter, and after each letter it is checked if we have
+// found a new word yet or if this one has been seen before. It should be clear that
+// it is very inefficient to do a hash lookup for every added letter. By keeping the
+// set of words in a tree we can walk down this tree as we add letters.
+// We keep a separate "accepted" bitfield instead of just using presence in `next`,
+// so we can create the next tree level lazily. After all, just because we created
+// this word doesn't mean we will create a word that has this word as a prefix.
+// Keeping a `rejected` bitmask as well is probably kind of pointless as the
+// rejection check does not show up on benchmarks, but we might as well cache it.
 #[derive(Default)]
 struct WordTreeNode {
     accepted: u32,
     rejected: u32,
-    next: LetterDict<Box<Self>>,
+    next: LetterMap<Box<Self>>,
 }
 
 impl WordTreeNode {
-    fn lookup(&mut self, letter: u8) -> &mut Self {
+    fn get_mut(&mut self, letter: u8) -> &mut Self {
         self.next.get_or_insert_with(letter, Default::default).as_mut()
     }
 
@@ -164,27 +186,25 @@ impl WordTreeNode {
     }
 }
 
+// One bad thing about this is that the most expensive processing we do on this
+// structure (the loop in next_letter) has to chase a pointer every time just to
+// read the `total` field. But it's not really possible to optimize further without
+// changing the logic beyond recognition.
 #[derive(Default, Debug)]
 struct MarkovNode {
-    total: u64,
+    total: u32,
     letter: u8,
-    letters: LetterDict<Box<Self>>,
+    letters: LetterMap<Box<Self>>,
 }
 
 impl MarkovNode {
-
-    fn train(&mut self, word: &[u8]) {
-        let mut m = self;
-        m.total += 1;
-        for b in word.bytes() {
-            m = m.letters.get_or_insert_with(b, Default::default);
-            m.letter = b;
-            m.total += 1;
-        }
+    fn get(&self, letter: u8) -> Option<&Self> {
+        self.letters.get(letter).map(|v| &**v)
     }
 
-    fn lookup(&self, letter: u8) -> Option<&Self> {
-        self.letters.get(letter).map(|v| &**v)
+    fn get_mut(&mut self, letter: u8) -> &mut Self {
+        self.letters.get_or_insert_with(letter, 
+            || Box::new(Self { letter, ..Default::default() }))
     }
 
     fn iter_present(&self) -> impl Iterator<Item=&Self> {
@@ -192,19 +212,28 @@ impl MarkovNode {
     }
 }
 
-fn next_letter(root: &MarkovNode, word_tail: &[u8], random: &mut PythonRandom) -> u8 {
+fn train(root: &mut MarkovNode, ngram: &[u8]) {
+    let mut m = root;
+    m.total += 1;
+    for &b in ngram {
+        m = m.get_mut(b);
+        m.total += 1;
+    }
+}
+
+fn next_letter(root: &MarkovNode, ngram: &[u8], random: &mut PythonRandom) -> u8 {
 
     // Bug in original implementation:
     // This assumes the letter must be present in the root node.
     // This is not guaranteed to be the case, but with the chosen
     // random seed the unwrap() happens to never fail.
     let mut m = root;
-    for &b in word_tail {
-        m = m.lookup(b).or_else(|| root.lookup(b)).unwrap();
+    for &b in ngram {
+        m = m.get(b).or_else(|| root.get(b)).unwrap();
     }
 
-    assert!(m.total > 0);
-    let mut num = random.randint(0, m.total - 1);
+    debug_assert!(m.total > 0);
+    let mut num = random.randint(0, m.total as u64 - 1) as u32;
 
     for x in m.iter_present() {
         if x.total > num {
@@ -392,12 +421,14 @@ impl Book {
 
 fn main() -> Result<(), Box<dyn std::error::Error>>  {
 
-    println!("Getting the reference text");
+    let data = fs::read("11940-8.txt")
+        .expect("input not found, please wget http://www.gutenberg.org/files/11940/11940-8.txt");
 
-    let data = fs::read("11940-8.txt")?;
-
-    let text = decode_latin1(&data).to_lowercase();
-    let text = text.replace("ä", "a").replace("å", "a").replace("ö", "o");
+    let text = decode_latin1(&data)
+        .to_lowercase()
+        .replace("ä", "a")
+        .replace("å", "a")
+        .replace("ö", "o");
 
     let mut slice = &text[..];
     slice = &slice[slice.find("start of th").unwrap()..];
@@ -415,7 +446,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>>  {
     println!("Getting reference words");
 
     // Order is not important here, so ensure uniqueness by collecting into a set.
-    let all_words: HashSet<&[u8]> = slice.as_bytes()
+    let all_words: HashSet<&[u8]> = slice
+        .as_bytes()
         .fields_with(|b| !b.is_ascii_lowercase())
         .collect();
 
@@ -426,10 +458,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>>  {
     let mut markov = MarkovNode::default();
 
     for word in all_words {
-        let mut word = &word[..];
-        while word.len() >= 3 {
-            markov.train(&word[..3]);
-            word = &word[1..];
+        for trigram in word.windows(3) {
+            train(&mut markov, trigram);
         }
     }
 
@@ -454,9 +484,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>>  {
         let mut letter;
 
         loop {
-            let word_tail = &word[word.len().saturating_sub(2)..];
+            let ngram = &word[word.len().saturating_sub(2)..];
 
-            letter = next_letter(&markov, &word_tail, &mut random);
+            letter = next_letter(&markov, &ngram, &mut random);
 
             word.push(letter);
 
@@ -464,13 +494,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>>  {
                 break;
             }
 
-            word_tree_node = word_tree_node.lookup(letter);
+            word_tree_node = word_tree_node.get_mut(letter);
         }
 
         if word_tree_node.is_rejected(letter) {
             continue;
         }
 
+        // Bug in original implementation:
+        // A word must contain a vowel. Okay. But the way words are constructed, every prefix
+        // of a word needs to be a valid word itself. End result: only words that start with
+        // a vowel can be generated by this program. So we only check the first letter.
+        // Note that we still have to *generate* the whole word, just to keep the state of the
+        // random number generator in sync with the original implementation.
         if !VOWELS.contains(&word[0]) || FORBIDDEN_MATCHER.is_match(&word) {
             word_tree_node.set_rejected(letter);
             continue;
@@ -486,7 +522,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>>  {
 
     }
 
-    // Leak memory because it's faster O:)
+    // Leak memory because it's faster, we will end the entire process soon enough.
     std::mem::forget(word_tree_root);
 
     println!("Capitalizing some words");
