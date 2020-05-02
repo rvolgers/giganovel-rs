@@ -8,6 +8,8 @@ use rand_python::{PythonRandom, MersenneTwister};
 use aho_corasick::{AhoCorasick, AhoCorasickBuilder};
 use std::{fmt::Debug, io, collections::HashSet};
 use bstr::{BString, BStr, ByteSlice};
+use arrayvec::ArrayVec;
+
 use lazy_static::lazy_static;
 
 // Seed for the random number generator, for consistent output.
@@ -91,52 +93,40 @@ struct LookupMarkovNode {
     total: u64,
     letter: u8,
     present: u32,
-    letters: [Option<Box<Self>>; 26],
+    letters: ArrayVec::<[Box<Self>; 26]>,
+    //letters: [Option<Box<Self>>; 26],
 }
 
 impl LookupMarkovNode {
-    fn from_training(mut training: TrainMarkovNode) -> Self {
-        let mut tmp = Self {
+    fn bit(letter: u8) -> u32 {
+        1u32 << byte_to_index(letter)
+    }
+
+    fn rank(&self, letter: u8) -> usize {
+        let mask = Self::bit(letter) - 1;
+        (self.present & mask).count_ones() as usize
+    }
+
+    fn from_training(training: &TrainMarkovNode) -> Self {
+        Self {
             total: training.total,
             letter: training.letter,
-            ..Default::default()
-        };
-
-        for (a, b) in tmp.letters.iter_mut().zip(training.letters.iter_mut()) {
-            *a = b.take().map(|m| Box::new(Self::from_training(*m)));
+            present: training.letters.iter().map(|n| if let Some(n) = n { Self::bit(n.letter) } else { 0 }).sum(),
+            letters: training.letters.iter().flatten().map(|n| Box::new(Self::from_training(n))).collect(),
         }
-
-        let mut dest_idx = 0;
-
-        for i in 0..26 {
-            if dest_idx < i {
-                if let Some(n) = tmp.letters[i].take() {
-                    tmp.letters[dest_idx] = Some(n);
-                    dest_idx += 1;
-                    tmp.present |= 1 << i;
-                }
-            }
-            else if let Some(_) = &mut tmp.letters[i] {
-                dest_idx += 1;
-                tmp.present |= 1 << i;
-            }
-        }
-
-        tmp
     }
 
     fn iter_present(&self) -> impl Iterator<Item=&Self> {
-        let max = self.present.count_ones();
-        self.letters[..max as usize].iter().flatten().map(|c| c.as_ref())
+        assert!(self.letters.len() == self.present.count_ones() as usize);
+        self.letters.iter().map(|x| &**x)
     }
 
     fn lookup(&self, letter: u8) -> Option<&Self> {
-        let abc_index = byte_to_index(letter);
-        let bit = 1 << abc_index;
-        if self.present & bit == 0 { return None; }
-        let offset = ((bit - 1) & self.present).count_ones();
-        let m: Option<&Self> = self.letters[offset as usize].as_ref().map(|c| c.as_ref());
-        m
+        if self.present & Self::bit(letter) != 0 {
+            Some(&*self.letters[self.rank(letter)])
+        } else {
+            None
+        }
     }
 
 }
@@ -154,7 +144,7 @@ impl MarkovLookup {
 
     fn new(training_root: TrainMarkovNode) -> Self {
         MarkovLookup {
-            root: LookupMarkovNode::from_training(training_root),
+            root: LookupMarkovNode::from_training(&training_root),
         }
     }
 
