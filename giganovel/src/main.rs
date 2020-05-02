@@ -149,27 +149,29 @@ struct WordTreeNode {
     next: LetterDict<Box<Self>>,
 }
 
-enum LookupResult<'a> {
-    Accepted,
-    Rejected,
-    Exists(&'a mut WordTreeNode),
-}
-
 impl WordTreeNode {
-    fn lookup(&mut self, word: &[u8]) -> LookupResult {
-        let letter = word[word.len() - 1];
+    fn lookup(&mut self, letter: u8) -> &mut Self {
+        self.next.get_or_insert_with(letter, Default::default).as_mut()
+    }
+
+    fn is_rejected(&self, letter: u8) -> bool {
         let bit = 1 << byte_to_index(letter);
-        if self.accepted & bit != 0 {
-            LookupResult::Exists(self.next.get_or_insert_with(letter, Default::default).as_mut())
-        } else if self.rejected & bit != 0 {
-            LookupResult::Rejected
-        } else if VOWELS.contains(&word[0]) && !FORBIDDEN_MATCHER.is_match(&word) {
-            self.accepted |= bit;
-            LookupResult::Accepted
-        } else {
-            self.rejected |= bit;
-            LookupResult::Rejected
-        }
+        self.rejected & bit != 0
+    }
+
+    fn is_accepted(&self, letter: u8) -> bool {
+        let bit = 1 << byte_to_index(letter);
+        self.accepted & bit != 0
+    }
+
+    fn set_rejected(&mut self, letter: u8) {
+        let bit = 1 << byte_to_index(letter);
+        self.rejected |= bit;
+    }
+
+    fn set_accepted(&mut self, letter: u8) {
+        let bit = 1 << byte_to_index(letter);
+        self.accepted |= bit;
     }
 }
 
@@ -201,9 +203,7 @@ impl MarkovNode {
     }
 }
 
-
-// Helpers for indexing into MarkovNode.letters
-fn index_to_byte(i: usize) -> u8 { b'a' + i as u8 }
+// Helper for converting b'a'..b'z' => 0..26
 fn byte_to_index(b: u8) -> usize { b as usize - b'a' as usize }
 
 #[derive(Default)]
@@ -482,37 +482,35 @@ fn main() -> Result<(), Box<dyn std::error::Error>>  {
 
         word.clear();
         let mut word_tree_node = &mut word_tree_root;
+        let mut letter;
 
         loop {
             // Add a new letter to the word and update the word_set_short index.
 
             let word_tail = &word[word.len().saturating_sub(2)..];
 
-            let letter = markov.next_letter(&word_tail, &mut random);
+            letter = markov.next_letter(&word_tail, &mut random);
 
             word.push(letter);
 
-            word_tree_node = match word_tree_node.lookup(&word) {
-                LookupResult::Exists(x) => x,
-                LookupResult::Rejected => break,
-                LookupResult::Accepted => {
-                    // let (head, tail) = wordbuf_write.split_at_mut(WORD_SIZE);
-                    // wordbuf_write = tail;
-                    // head[..w.len()].copy_from_slice(&w);
+            if !word_tree_node.is_accepted(letter) { break; }
 
-                    word_list.push(ShortWord::from(&word[..]));
+            word_tree_node = word_tree_node.lookup(letter);
+        }
 
-                    // Progress report.
-                    //if (DISTINCT_WORDS - (wordbuf_write.len() / WORD_SIZE)) % 100000 == 0 {
-                    if word_list.len() % 100000 == 0 {
-                        //println!("{} words generated", DISTINCT_WORDS - (wordbuf_write.len() / WORD_SIZE));
-                        println!("{} words generated", word_list.len());
-                    }
+        if word_tree_node.is_rejected(letter) { continue; }
 
-                    break
-                }
-            };
+        if !VOWELS.contains(&word[0]) || FORBIDDEN_MATCHER.is_match(&word) {
+            word_tree_node.set_rejected(letter);
+            continue;
+        }
 
+        word_tree_node.set_accepted(letter);
+        word_list.push(ShortWord::from(&word[..]));
+
+        // Progress report.
+        if word_list.len() % 100000 == 0 {
+            println!("{} words generated", word_list.len());
         }
 
     }
