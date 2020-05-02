@@ -1,17 +1,15 @@
-use std::hash::BuildHasher;
-use std::hash::Hasher;
-use std::cmp::Reverse;
-use std::collections::{HashSet, BinaryHeap};
-use std::cmp::Ordering;
+
+
+
 use std::io::Write;
 use std::fs;
 use encoding_rs::mem::decode_latin1;
 use rand_python::{PythonRandom, MersenneTwister};
-use aho_corasick::AhoCorasickBuilder;
-use std::{fmt::Debug, io, cmp::PartialOrd, convert::TryInto, hash::Hash};
-use bitvec::prelude::{bitbox, Lsb0};
+use aho_corasick::{AhoCorasick, AhoCorasickBuilder};
+use std::{fmt::Debug, io};
 use fnv::FnvHashSet;
 use bstr::{BString, BStr, ByteSlice};
+use lazy_static::lazy_static;
 
 // Seed for the random number generator, for consistent output.
 // Comment from original code follows:
@@ -29,187 +27,41 @@ const FORBIDDEN: &[&str] = &["satan", "lenin", "stalin", "hitl", "naz", "rus", "
 const TAB: &[u8] = b"   ";
 const LINE_WIDTH: usize = 76;
 
-
+lazy_static! {
+    static ref FORBIDDEN_MATCHER: AhoCorasick = AhoCorasickBuilder::new()
+        .auto_configure(FORBIDDEN)
+        .build(FORBIDDEN);
+}
 
 const WORD_SIZE: usize = 16;
 
-/// Value type that behaves like a vector of bits with max length 64.
-/// Used for representing (sequences of) huffman codes.
-#[derive(Clone, Copy, Default, Debug, PartialEq, Eq, Hash)]
-struct SmolBitvec {
-    used: u8,
-    bits: u64,
+#[derive(Default)]
+struct WordTreeNode {
+    accepted: u32,
+    rejected: u32,
+    next: [Option<Box<Self>>; 26],
 }
 
-impl SmolBitvec {
-    fn new() -> Self { Default::default() }
-
-    fn len(&self) -> u8 {
-        self.used
-    }
-
-    fn mask(&self) -> u64 {
-        u64::MAX >> (64 - self.used)
-    }
-
-    fn checked_extend(&self, other: &SmolBitvec) -> Option<Self> {
-        if self.used + other.used > 64  {
-            return None;
-        }
-        Some(Self {
-            used: self.used + other.used,
-            bits: (self.bits << other.used) | other.bits,
-        })
-    }
-
-    fn checked_push(&self, bit: bool) -> Option<Self> {
-        if self.used + 1 > 64 {
-            return None;
-        }
-        Some(Self {
-            used: self.used + 1,
-            bits: (self.bits << 1) | (bit as u64),
-        })
-    }
-
-    fn reverse(&self) -> Self {
-        Self {
-            used: self.used,
-            bits: self.bits.reverse_bits() >> (64 - self.used),
-        }
-    }
-
-    fn to_u64(&self) -> u64 {
-        self.bits
-    }
+enum LookupResult<'a> {
+    Accepted,
+    Rejected,
+    Exists(&'a mut WordTreeNode),
 }
 
-
-/// Generates huffman codes for a given set of symbols and their corresponding weights.
-///
-/// This does lots of allocations, but it's not called that often so probably not worth optimizing.
-fn huffman<T: Debug>(weights_and_symbols: impl Iterator<Item=(usize, T)>) -> Vec::<(SmolBitvec, T)> {
-    enum HuffmanNodeContents<T> {
-        Node(Box<HuffmanNode<T>>, Box<HuffmanNode<T>>),
-        Leaf(T),
-    }
-
-    struct HuffmanNode<T> {
-        weight: usize,
-        contents: HuffmanNodeContents<T>,
-    }
-
-    // Um, std::collections, all I wanted was a minheap by HuffmanNode.weight, ok?
-    // This is a crazy amount of impls you're asking for.
-
-    impl<T> PartialOrd for HuffmanNode<T> {
-        fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-            Some(self.cmp(other))
-        }
-    }
-
-    impl<T> Ord for HuffmanNode<T> {
-        fn cmp(&self, other: &Self) -> Ordering {
-            self.weight.cmp(&other.weight).reverse()
-        }
-    }
-
-    impl<T> PartialEq for HuffmanNode<T> {
-        fn eq(&self, other: &Self) -> bool {
-            self.weight == other.weight
-        }
-    }
-
-    impl<T> Eq for HuffmanNode<T> {}
-
-    // Initialize heap with every node a leaf node
-    let mut heap = weights_and_symbols
-        .map(|(weight, s)| Box::new(HuffmanNode { weight, contents: HuffmanNodeContents::Leaf(s) }))
-        .collect::<BinaryHeap<_>>();
-
-    // Put the two nodes with lowest weight under a new common parent until a single node remains.
-    while heap.len() > 1 {
-        let a = heap.pop().unwrap();
-        let b = heap.pop().unwrap();
-        heap.push( Box::new(HuffmanNode {
-            weight: a.weight + b.weight,
-            contents: HuffmanNodeContents::Node(a, b),
-        }));
-    }
-
-    let mut codes = Vec::<(SmolBitvec, T)>::new();
-
-    // Walk the tree, appending the symbol and the huffman code for each leaf node to `codes`.
-    // Use recursion for simplicity here since we will never have many nodes.
-    // (Note that heap.pop().is_none() can happen here, but only if the input was zero length.)
-    if let Some(root) = heap.pop() {
-        fn collect<T>(node: Box<HuffmanNode<T>>, code: SmolBitvec, dest: &mut Vec<(SmolBitvec, T)>) {
-            match node.contents {
-                HuffmanNodeContents::Node(a, b) => {
-                    collect(a, code.checked_push(false).unwrap(), dest);
-                    collect(b, code.checked_push(true).unwrap(), dest);
-                }
-                HuffmanNodeContents::Leaf(t) => {
-                    dest.push((code, t));
-                }
-            }
-        };
-
-        collect(root, SmolBitvec::new(), &mut codes);
-    }
-
-    codes
-}
-
-const SET_BITS: usize = 32;
-
-/// Set that tracks which "words" we've already generated.
-/// The words are represented in a huffman compressed representation.
-/// By using a small-yet-lossless representation we can store almost all of them by indexing
-/// directly into a bitset, avoiding hash lookups. We're still spending most of our time
-/// waiting for memory, but overall we end up touching less cache lines per lookup, and
-/// use cache a bit more effectively for some very few words that compress to something
-/// *very* small.
-struct WordIndex {
-    bits: Vec<u64>,
-    hash: FnvHashSet::<SmolBitvec>,
-    bit_lookups: u64,
-    hash_lookups: u64,
-}
-
-impl WordIndex {
-    fn new() -> Self {
-        Self {
-            bits: vec![0; (1 << SET_BITS) / 64],
-            hash: FnvHashSet::with_capacity_and_hasher(0, Default::default()),
-            bit_lookups: 0,
-            hash_lookups: 0,
-        }
-    }
-
-    fn contains(&mut self, w: &SmolBitvec) -> bool {
-        if (w.mask() as usize) < self.bits.len() * 64 {
-            self.bit_lookups += 1;
-            let idx = w.to_u64() / 64;
-            let bit = w.to_u64() % 64;
-            ((self.bits[idx as usize] >> bit) & 1) != 0
-        }
-        else {
-            self.hash_lookups += 1;
-            self.hash.contains(w)
-        }
-    }
-
-    fn insert(&mut self, w: &SmolBitvec) {
-        if (w.mask() as usize) < self.bits.len() * 64 {
-            self.bit_lookups += 1;
-            let idx = w.to_u64() / 64;
-            let bit = w.to_u64() % 64;
-            self.bits[idx as usize] |= 1 << bit;
-        }
-        else {
-            self.hash_lookups += 1;
-            self.hash.insert(*w);
+impl WordTreeNode {
+    fn lookup(&mut self, word: &[u8]) -> LookupResult {
+        let index = byte_to_index(word[word.len() - 1]);
+        let bit = 1 << index;
+        if self.accepted & bit != 0 {
+            LookupResult::Exists(self.next[index as usize].get_or_insert_with(Default::default).as_mut())
+        } else if self.rejected & bit != 0 {
+            LookupResult::Rejected
+        } else if VOWELS.contains(&word[0]) && !FORBIDDEN_MATCHER.is_match(&word) {
+            self.accepted |= bit;
+            LookupResult::Accepted
+        } else {
+            self.rejected |= bit;
+            LookupResult::Rejected
         }
     }
 }
@@ -218,7 +70,7 @@ impl WordIndex {
 struct TrainMarkovNode {
     total: u64,
     letter: u8,
-    letters: [Option<Box<TrainMarkovNode>>; 26],
+    letters: [Option<Box<Self>>; 26],
 }
 
 impl TrainMarkovNode {
@@ -238,15 +90,14 @@ impl TrainMarkovNode {
 #[derive(Default, Debug)]
 struct LookupMarkovNode {
     total: u64,
-    huffman: SmolBitvec,
     letter: u8,
     present: u32,
-    letters: [Option<Box<LookupMarkovNode>>; 26],
+    letters: [Option<Box<Self>>; 26],
 }
 
 impl LookupMarkovNode {
-    fn from_training(mut training: TrainMarkovNode) -> LookupMarkovNode {
-        let mut tmp = LookupMarkovNode {
+    fn from_training(mut training: TrainMarkovNode) -> Self {
+        let mut tmp = Self {
             total: training.total,
             letter: training.letter,
             ..Default::default()
@@ -254,13 +105,6 @@ impl LookupMarkovNode {
 
         for (a, b) in tmp.letters.iter_mut().zip(training.letters.iter_mut()) {
             *a = b.take().map(|m| Box::new(Self::from_training(*m)));
-        }
-
-        let node_iter = tmp.letters.iter_mut()
-            .flatten()
-            .map(|n| (n.total as usize, n));
-        for (code, n) in huffman(node_iter) {
-            n.huffman = code;
         }
 
         let mut dest_idx = 0;
@@ -279,24 +123,20 @@ impl LookupMarkovNode {
             }
         }
 
-        tmp.present |= 1<<31;
-
         tmp
     }
 
-    fn iter_present(&self) -> impl Iterator<Item=&LookupMarkovNode> {
-        let max = (self.present & ((1 << 26) - 1)).count_ones();
+    fn iter_present(&self) -> impl Iterator<Item=&Self> {
+        let max = self.present.count_ones();
         self.letters[..max as usize].iter().flatten().map(|c| c.as_ref())
     }
 
-    fn index_packed(&self, letter: u8) -> Option<&LookupMarkovNode> {
-        assert!(self.present != 0);
-
+    fn lookup(&self, letter: u8) -> Option<&Self> {
         let abc_index = byte_to_index(letter);
         let bit = 1 << abc_index;
         if self.present & bit == 0 { return None; }
         let offset = ((bit - 1) & self.present).count_ones();
-        let m: Option<&LookupMarkovNode> = self.letters[offset as usize].as_ref().map(|c| c.as_ref());
+        let m: Option<&Self> = self.letters[offset as usize].as_ref().map(|c| c.as_ref());
         m
     }
 
@@ -309,42 +149,28 @@ fn byte_to_index(b: u8) -> usize { b as usize - b'a' as usize }
 #[derive(Default)]
 struct MarkovLookup {
     root: LookupMarkovNode,
-    huffman_vowels: [SmolBitvec; 26],
 }
 
 impl MarkovLookup {
 
-    fn new(training_root: TrainMarkovNode) -> MarkovLookup {
-        let mut tmp = MarkovLookup {
+    fn new(training_root: TrainMarkovNode) -> Self {
+        MarkovLookup {
             root: LookupMarkovNode::from_training(training_root),
-            ..Default::default()
-        };
-
-        // Special huffman table for first character of word, which has only vowels
-        let node_iter = tmp.root.letters.iter_mut()
-            .flatten()
-            .filter(|m| VOWELS.contains(&m.letter))
-            .map(|n| (n.total as usize, n));
-
-        for (code, n) in huffman(node_iter) {
-            tmp.huffman_vowels[byte_to_index(n.letter)] = code;
         }
-
-        tmp
     }
 
     fn lookup(&self, word_tail: &[u8]) -> Option<&LookupMarkovNode> {
         let mut m = &self.root;
 
         for &b in word_tail {
-            m = m.index_packed(b)
-                .or_else(|| self.root.index_packed(b))?;
+            m = m.lookup(b).or_else(|| self.root.lookup(b))?;
         }
 
         Some(m)
     }
 
-    fn next_letter(&self, word_tail: &[u8], random: &mut PythonRandom, huffman: &mut SmolBitvec) -> u8 {
+    fn next_letter(&self, word_tail: &[u8], random: &mut PythonRandom) -> u8 {
+
         // Bug in original implementation:
         // This assumes the letter must be present in the root node.
         // This is not guaranteed to be the case, but with the chosen
@@ -356,16 +182,7 @@ impl MarkovLookup {
 
         for x in m.iter_present() {
             if x.total > num {
-
-                let next_huffman = if word_tail.len() == 0 {
-                    &self.huffman_vowels[byte_to_index(x.letter)]
-                } else {
-                    &x.huffman
-                };
-
-                *huffman = huffman.checked_extend(next_huffman).unwrap();
-
-                return x.letter;
+                return x.letter
             }
             num -= x.total;
         }
@@ -547,7 +364,6 @@ impl Book<'_> {
             write.write_all(b"- ")?;
             write.write_all(word)?;
             write.write_all(b"\n")?;
-            //writeln!(write, "- {}", word)?;
         }
 
         Ok(())
@@ -607,161 +423,52 @@ fn main() -> Result<(), Box<dyn std::error::Error>>  {
     let mut random = PythonRandom::new(mt);
     random.seed_u32(RANDOM_SEED);
 
-    let mut word_index = WordIndex::new();
-
-    // println!("Using {} megabytes of RAM for word_bitvec", word_bitvec.len() / 8 / 1024 / 1024);
-
-    // The actual ordered list of words we will use later to pick words based on random numbers.
-    // We could use a set that preserves insertion order, but the hash lookups we save by using
-    // the word_set_short optimization outweighs the benefit of not duplicating storage.
-    //let mut word_list = Vec::<BString>::with_capacity(DISTINCT_WORDS);
-
-    // Could also use `regex`, but for this simple case we can use aho-corasick directly
-    // and save a dependency (regex depends on this library).
-    let forbidden = AhoCorasickBuilder::new()
-        .auto_configure(FORBIDDEN)
-        .build(FORBIDDEN);
+    let mut word_tree_root = WordTreeNode::default();
 
     // String that holds the current word.
     let mut w = BString::from("");
 
-    // TODO instead of this, it might be better to put an EOF token in each huffman tree,
-    //      and accumulate the bits in the other direction. Should improve locality.
-    // Cheating: hardcoded counts for each word length
-    let lengths: [usize; 20] = [
-        0,
-        6,
-        113,
-        1080,
-        11228,
-        99400,
-        496678,
-        1211867,
-        1486115,
-        1034258,
-        464479,
-        149554,
-        36546,
-        7273,
-        1200,
-        183,
-        20,
-        0,
-        0,
-        0,
-    ];
-
-    let length_huffman = {
-        let mut tmp: [Option<SmolBitvec>; 20] = Default::default();
-
-        let weights_and_symbols_iter = lengths.iter()
-            .enumerate()
-            .filter(|(_, &count)| count > 0)
-            .map(|(length, &count)| (count, length));
-            //.map(|(length, &count)| (lengths[..=length].iter().sum(), length));
-
-        for (code, length) in huffman(weights_and_symbols_iter) {
-            tmp[length] = Some(code);
-        }
-
-        tmp
-    };
-
-    let get_length_huffman = |wordlen: usize| {
-        length_huffman.get(wordlen).and_then(|&x| x)
-    };
-
-    let mut huffmaxbits = 0u8;
-
     let mut wordbuf = vec![0u8; WORD_SIZE * DISTINCT_WORDS];
     let mut wordbuf_write = &mut wordbuf[..];
-
-    let mut seen_above_8 = 0usize;
 
     while wordbuf_write.len() > 0 {
 
         w.clear();
-
-        let mut huffman = SmolBitvec::new();
-        let mut compressed_word = SmolBitvec::new();
+        let mut word_tree_node = &mut word_tree_root;
 
         // Add more letters until we find a word that hasn't been accepted yet.
         // (Could still be a word that will never be accepted due to later checks.)
         loop {
             // Add a new letter to the word and update the word_set_short index.
+
             let word_tail = &w[w.len().saturating_sub(2)..];
 
-            let letter = markov.next_letter(word_tail, &mut random, &mut huffman);
+            let letter = markov.next_letter(&word_tail, &mut random);
 
             w.push(letter);
 
-            compressed_word = length_huffman[w.len()].unwrap().checked_extend(&huffman).unwrap().reverse();
-            huffmaxbits = huffmaxbits.max(compressed_word.len());
+            word_tree_node = match word_tree_node.lookup(&w) {
+                LookupResult::Exists(x) => x,
+                LookupResult::Rejected => break,
+                LookupResult::Accepted => {
+                    let (head, tail) = wordbuf_write.split_at_mut(WORD_SIZE);
+                    wordbuf_write = tail;
+                    head[..w.len()].copy_from_slice(&w);
 
-            if w.len() == 1 && !VOWELS.contains(&w.as_bytes()[0]) {
-                break;
-            }
+                    // Progress report.
+                    if (DISTINCT_WORDS - (wordbuf_write.len() / WORD_SIZE)) % 100000 == 0 {
+                        println!("{} words generated", DISTINCT_WORDS - (wordbuf_write.len() / WORD_SIZE));
+                    }
 
-            // TODO debug the eof-in-huffman code.
-            // The reason for wanting a dedicated eof symbol at the end is that it might improve
-            // locality near the end of the hashing maybe?
-            // Having eof as a huffman symbol seems to make sense, but the problem is its
-            // probability distribution is sort of indepenent of the markov tables. Or at
-            // least not as well correlated, and it's hard to get a good estimate.
-            // NOTE You need to make sure the start of your bitstream is always aligned the same
-            //      (i.e. either hi-align it or flip the bit order).
+                    break
+                }
+            };
 
-            // if eof_huffman.1 < 63 && (1 << eof_huffman.1) < word_bitvec.len() {
-            //     huffindex = Some(eof_huffman.0);
-            // }
-
-            // if huffindex.is_some() {
-            //     huffgood += 1;
-            // } else {
-            //     huffbad += 1;
-            // }
-
-            if !word_index.contains(&compressed_word) { break; }
         }
 
-        // Check for vowels and forbidden words.
-        // Bug in original implementation:
-        // The word generation loop ends as soon as it produces a word that has
-        // not previously been accepted. But then it will only accept a word if
-        // it contains a vowel. Unintended consequence: every word must start
-        // with a vowel. So we can just perform this check on the first letter.
-        if VOWELS.contains(&w.as_bytes()[0]) && !forbidden.is_match(&w) {
-            // Accepted, so make a note that we've seen this word now.
-            word_index.insert(&compressed_word);
-
-            if w.len() > 8 {
-                seen_above_8 += 1;
-            }
-
-            let (head, tail) = wordbuf_write.split_at_mut(WORD_SIZE);
-            wordbuf_write = tail;
-            head[..w.len()].copy_from_slice(&w);
-
-            // Progress report.
-            if (DISTINCT_WORDS - (wordbuf_write.len() / WORD_SIZE)) % 100000 == 0 {
-                println!("{} words generated", DISTINCT_WORDS - (wordbuf_write.len() / WORD_SIZE));
-                //println!("Length above 8: {}", seen_above_8);
-            }
-        }
     }
 
     drop(wordbuf_write);
-
-    println!("{} out of {} lookups used the word_bitvec, {} didn't, longest huffman encoded word (including length) was {} bits", word_index.bit_lookups, word_index.bit_lookups + word_index.hash_lookups, word_index.hash_lookups, huffmaxbits);
-
-    // let mut lengths = [0usize; 20];
-    // for w in &word_list {
-    //     lengths[w.len()] += 1;
-    // }
-    // dbg!(lengths);
-
-    drop(word_index);
-    //drop(word_set);
 
     println!("Capitalizing some words");
 
@@ -773,9 +480,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>>  {
 
     println!("Generating text");
 
-    let mut writer = io::BufWriter::with_capacity(1024 * 1024 * 4, fs::File::create("giganovel.txt").unwrap());
-
-    //let mut writer = io::Cursor::new(vec![0u8; 1073742004]);
+    let writer = fs::File::create("giganovel.txt").unwrap();
+    let mut writer = io::BufWriter::with_capacity(1024 * 1024 * 4, writer);
 
     let mut book = Book::new(&wordbuf);
 
@@ -785,8 +491,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>>  {
         book.next_word(&mut random, &mut writer)?;
     }
     book.end(&mut writer)?;
-
-    //fs::File::create("giganovel.txt").unwrap().write_all(writer.into_inner().as_mut())?;
 
     Ok(())
 }

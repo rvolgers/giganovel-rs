@@ -232,6 +232,7 @@ dependencies = [
  "bstr",
  "encoding_rs",
  "fnv",
+ "lazy_static",
  "rand-python",
 ]
 
