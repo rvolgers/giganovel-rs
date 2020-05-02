@@ -54,18 +54,16 @@ struct ShortWord {
 }
 
 impl ShortWord {
+    fn new(src: &[u8]) -> Self {
+        let mut data = [0u8; 16];
+        data[..src.len()].copy_from_slice(src);
+        Self { data }
+    }
+
     fn len(&self) -> usize {
         // wacky micro optimization. this does the same as the following line.
         // self.data.iter().position(|&b| b == 0).unwrap_or(16)
         16 - (u128::from_le_bytes(self.data).leading_zeros() / 8) as usize
-    }
-}
-
-impl From<&[u8]> for ShortWord {
-    fn from(src: &[u8]) -> Self {
-        let mut data = [0u8; 16];
-        data[..src.len()].copy_from_slice(src);
-        Self { data }
     }
 }
 
@@ -479,7 +477,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>>  {
         }
 
         word_tree_node.set_accepted(letter);
-        word_list.push(ShortWord::from(&word[..]));
+        word_list.push(ShortWord::new(&word));
 
         // Progress report.
         if word_list.len() % 100000 == 0 {
