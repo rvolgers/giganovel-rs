@@ -296,10 +296,13 @@ impl Book {
         Ok(())
     }
 
-    fn next_word_index(&self, random: &mut PythonRandom) -> usize {
+    fn generate_next_word(&mut self, random: &mut PythonRandom) -> ShortWord {
         loop {
             let i = random.expovariate(LAMBDA) as usize;
-            if i < self.words.len() { return i }
+            if i < self.words.len() {
+                self.counter[i] += 1;
+                return self.words[i];
+            }
         }
     }
 
@@ -307,44 +310,35 @@ impl Book {
         // Pick a random word. This was moved to this type so we can use the
         // generated index to count how often each word is used without needing
         // a separate hash lookup to get the count for a word.
-        let i = self.next_word_index(random);
-        self.counter[i] += 1;
+        let mut word = self.generate_next_word(random);
 
-        let word = self.words[i];
+        if self.capitalize {
+            word[0].make_ascii_uppercase();
+        }
+        let word: &[u8] = word.as_ref();
 
-        let mut punctuation: Option<u8> = None;
+        let mut punctuation = b"".as_ref();
 
         // Only capitalize one word at a time, except if we're still in
         // the front matter block, in that case following words should
         // still be capitalized as well.
         // In the original code capitalization is handled separately for
         // front matter and for normal text.
-        let capitalize = self.capitalize;
         if self.front {
             self.capitalize = false;
         }
 
-        let push_word = |line: &mut BString| {
-            if capitalize {
-                line.push(word[0].to_ascii_uppercase());
-                line.extend(&word[1..]);
-            }
-            else {
-                line.extend(word.bytes());
-            }
-        };
-
         if !self.front {
             if self.title.fields().count() < 2 {
-                push_word(&mut self.title);
+                self.title.extend(word.bytes());
                 self.title.push(b' ');
             }
             else if self.author.fields().count() < 2 {
-                push_word(&mut self.author);
+                self.author.extend(word.bytes());
                 self.author.push(b' ');
             }
             else {
-                push_word(&mut self.verlag);
+                self.verlag.extend(word.bytes());
                 self.print_front(write)?;
             }
             return Ok(());
@@ -353,32 +347,28 @@ impl Book {
         let mut paragraph = false;
 
         if random.randint(0, 9) == 0 {
-            punctuation = Some(b',');
+            punctuation = b",".as_ref();
         }
         else if random.randint(0, 9) == 0 {
-            punctuation = Some(b'.');
+            punctuation = b".".as_ref();
             self.capitalize = true;
             if random.randint(0, 9) == 0 {
                 paragraph = true;
             }
         }
 
-        if self.line.len() + 1 + word.len() + punctuation.iter().count() > LINE_WIDTH {
+        if self.line.len() + 1 + word.len() + punctuation.len() > LINE_WIDTH {
             self.line.push(b'\n');
             self.length += self.line.len();
             write.write_all(self.line.as_bytes())?;
             self.line.clear();
-            push_word(&mut self.line);
-            if let Some(b) = punctuation {
-                self.line.push(b);
-            }
+            self.line.extend(word);
+            self.line.extend(punctuation);
         }
         else if paragraph {
             self.line.push(b' ');
-            push_word(&mut self.line);
-            if let Some(b) = punctuation {
-                self.line.push(b);
-            }
+            self.line.extend(word);
+            self.line.extend(punctuation);
             self.line.push(b'\n');
             self.line.push(b'\n');
             self.length += self.line.len();
@@ -388,10 +378,8 @@ impl Book {
         }
         else {
             self.line.push(b' ');
-            push_word(&mut self.line);
-            if let Some(b) = punctuation {
-                self.line.push(b);
-            }
+            self.line.extend(word);
+            self.line.extend(punctuation);
         }
 
         Ok(())
