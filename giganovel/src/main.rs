@@ -548,9 +548,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>>  {
     let mut last_mb = 0usize;
     while book.len() < BOOK_SIZE {
         book.next_word(&mut random, &mut writer)?;
-        if book.len() > (last_mb + 10) * 1024 * 1024 {
-            last_mb += 10;
-            println!("{}MiB generated", last_mb);
+        if book.len() > (last_mb + 20) * 1024 * 1024 {
+            last_mb += 20;
+            println!("{}MiB of text generated", last_mb);
         }
     }
     book.end(&mut writer)?;
