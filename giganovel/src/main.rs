@@ -249,6 +249,20 @@ fn next_letter(root: &MarkovNode, ngram: &[u8], random: &mut PythonRandom) -> u8
     panic!("inconsistent tree");
 }
 
+#[derive(Eq, PartialEq, Debug)]
+enum WordFlags {
+    Normal,
+    Comma,
+    Period,
+    Paragraph,
+}
+
+#[derive(Debug)]
+enum Pregenerated {
+    WordIndex(usize),
+    WordFlags(WordFlags),
+}
+
 struct Book {
     title: BString,
     author: BString,
@@ -260,6 +274,7 @@ struct Book {
     counter: Vec<usize>,
     words: Vec<ShortWord>,
     length: usize,
+    pregenerated: Vec<Pregenerated>,
 }
 
 impl Book {
@@ -275,6 +290,7 @@ impl Book {
             counter: vec![0; words.len()],
             words,
             length: 0,
+            pregenerated: Vec::new(),
         }
     }
 
@@ -296,13 +312,40 @@ impl Book {
         Ok(())
     }
 
-    fn generate_next_word(&mut self, random: &mut PythonRandom) -> &ShortWord {
+    fn generate_next_word_index(&mut self, random: &mut PythonRandom) -> usize {
+        if let Some(pregenerated) = self.pregenerated.pop() {
+            if let Pregenerated::WordIndex(i) = pregenerated {
+                return i;
+            } else {
+                panic!();
+            }
+        }
         loop {
             let i = random.expovariate(LAMBDA) as usize;
             if i < self.words.len() {
-                self.counter[i] += 1;
-                return &self.words[i];
+                return i;
             }
+        }
+    }
+
+    fn generate_next_flags(&mut self, random: &mut PythonRandom) -> WordFlags {
+        if let Some(pregenerated) = self.pregenerated.pop() {
+            if let Pregenerated::WordFlags(w) = pregenerated {
+                return w;
+            } else {
+                panic!();
+            }
+        }
+        if random.randint(0, 9) == 0 {
+            WordFlags::Comma
+        } else if random.randint(0, 9) == 0 {
+            if random.randint(0, 9) == 0 {
+                WordFlags::Paragraph
+            } else {
+                WordFlags::Period
+            }
+        } else {
+            WordFlags::Normal
         }
     }
 
@@ -318,8 +361,12 @@ impl Book {
         // Pick a random word. This was moved to this type so we can use the
         // generated index to count how often each word is used without needing
         // a separate hash lookup to get the count for a word.
+        let word_index = self.generate_next_word_index(random);
+
+        self.counter[word_index] += 1;
+
         let mut word = ArrayVec::<[u8; 17]>::new();
-        word.try_extend_from_slice(self.generate_next_word(random)).unwrap();
+        word.try_extend_from_slice(&self.words[word_index]).unwrap();
 
         if self.capitalize {
             word[0].make_ascii_uppercase();
@@ -350,18 +397,32 @@ impl Book {
             return Ok(());
         }
 
-        let mut paragraph = false;
+        let wordflags = self.generate_next_flags(random);
 
-        if random.randint(0, 9) == 0 {
-            word.push(b',');
+        let tmp = self.generate_next_word_index(random);
+        let tmp1 = Pregenerated::WordIndex(tmp);
+        let tmp2 = Pregenerated::WordFlags(self.generate_next_flags(random));
+        self.pregenerated.push(tmp2);
+        self.pregenerated.push(tmp1);
+        unsafe {
+            core::arch::x86_64::_mm_prefetch(&self.words[tmp] as *const _ as *const i8, core::arch::x86_64::_MM_HINT_T2);
         }
-        else if random.randint(0, 9) == 0 {
-            word.push(b'.');
-            self.capitalize = true;
-            if random.randint(0, 9) == 0 {
-                paragraph = true;
+
+        match wordflags {
+            WordFlags::Normal => {}
+            WordFlags::Comma => {
+                word.push(b',');
+            }
+            WordFlags::Period => {
+                word.push(b'.');
+            }
+            WordFlags::Paragraph => {
+                word.push(b'.');
+                self.capitalize = true;
             }
         }
+
+        let paragraph = wordflags == WordFlags::Paragraph;
 
         if self.line.len() + 1 + word.len() > LINE_WIDTH {
             self.write_line(write)?;
@@ -378,6 +439,7 @@ impl Book {
             self.line.push(b' ');
             self.line.extend_from_slice(&word);
         }
+
 
         Ok(())
     }
