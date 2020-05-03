@@ -22,7 +22,7 @@ use encoding_rs::mem::decode_latin1;
 use rand_python::{PythonRandom, MersenneTwister};
 use aho_corasick::{AhoCorasick, AhoCorasickBuilder};
 use std::{fmt::Debug, io, collections::HashSet, ops::{DerefMut, Deref}};
-use bstr::{BString, ByteSlice};
+use bstr::{BString, ByteSlice, BStr};
 use arrayvec::ArrayVec;
 
 use lazy_static::lazy_static;
@@ -64,7 +64,7 @@ fn byte_to_bit(b: u8) -> u32 { 1 << byte_to_index(b) }
 // Basically we store them padded with '\0' bytes, which cannot occur in generated
 // words, and determine the length based on that when we need it. Reminds me of
 // strncpy in C :)
-#[derive(Default, Copy, Clone, Debug)]
+#[derive(Default, Copy, Clone)]
 #[repr(align(16))]
 struct ShortWord {
     data: [u8; 16],
@@ -296,28 +296,34 @@ impl Book {
         Ok(())
     }
 
-    fn generate_next_word(&mut self, random: &mut PythonRandom) -> ShortWord {
+    fn generate_next_word(&mut self, random: &mut PythonRandom) -> &ShortWord {
         loop {
             let i = random.expovariate(LAMBDA) as usize;
             if i < self.words.len() {
                 self.counter[i] += 1;
-                return self.words[i];
+                return &self.words[i];
             }
         }
+    }
+
+    fn write_line<W: Write>(&mut self, write: &mut W) -> io::Result<()> {
+        self.line.push(b'\n');
+        self.length += self.line.len();
+        write.write_all(&self.line)?;
+        self.line.clear();
+        Ok(())
     }
 
     fn next_word<W: Write>(&mut self, random: &mut PythonRandom, write: &mut W) -> io::Result<()> {
         // Pick a random word. This was moved to this type so we can use the
         // generated index to count how often each word is used without needing
         // a separate hash lookup to get the count for a word.
-        let mut word = self.generate_next_word(random);
+        let mut word = ArrayVec::<[u8; 17]>::new();
+        word.try_extend_from_slice(self.generate_next_word(random)).unwrap();
 
         if self.capitalize {
             word[0].make_ascii_uppercase();
         }
-        let word: &[u8] = word.as_ref();
-
-        let mut punctuation = b"".as_ref();
 
         // Only capitalize one word at a time, except if we're still in
         // the front matter block, in that case following words should
@@ -330,15 +336,15 @@ impl Book {
 
         if !self.front {
             if self.title.fields().count() < 2 {
-                self.title.extend(word.bytes());
+                self.title.extend_from_slice(&word);
                 self.title.push(b' ');
             }
             else if self.author.fields().count() < 2 {
-                self.author.extend(word.bytes());
+                self.author.extend_from_slice(&word);
                 self.author.push(b' ');
             }
             else {
-                self.verlag.extend(word.bytes());
+                self.verlag.extend_from_slice(&word);
                 self.print_front(write)?;
             }
             return Ok(());
@@ -347,39 +353,30 @@ impl Book {
         let mut paragraph = false;
 
         if random.randint(0, 9) == 0 {
-            punctuation = b",".as_ref();
+            word.push(b',');
         }
         else if random.randint(0, 9) == 0 {
-            punctuation = b".".as_ref();
+            word.push(b'.');
             self.capitalize = true;
             if random.randint(0, 9) == 0 {
                 paragraph = true;
             }
         }
 
-        if self.line.len() + 1 + word.len() + punctuation.len() > LINE_WIDTH {
-            self.line.push(b'\n');
-            self.length += self.line.len();
-            write.write_all(self.line.as_bytes())?;
-            self.line.clear();
-            self.line.extend(word);
-            self.line.extend(punctuation);
+        if self.line.len() + 1 + word.len() > LINE_WIDTH {
+            self.write_line(write)?;
+            self.line.extend_from_slice(&word);
         }
         else if paragraph {
             self.line.push(b' ');
-            self.line.extend(word);
-            self.line.extend(punctuation);
+            self.line.extend_from_slice(&word);
             self.line.push(b'\n');
-            self.line.push(b'\n');
-            self.length += self.line.len();
-            write.write_all(self.line.as_bytes())?;
-            self.line.clear();
-            self.line.extend(TAB.bytes());
+            self.write_line(write)?;
+            self.line.extend_from_slice(TAB);
         }
         else {
             self.line.push(b' ');
-            self.line.extend(word);
-            self.line.extend(punctuation);
+            self.line.extend_from_slice(&word);
         }
 
         Ok(())
