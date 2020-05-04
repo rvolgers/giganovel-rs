@@ -123,7 +123,7 @@ impl MersenneTwister {
 
             unsafe {
                 for i in (0..N).step_by(64) {
-                    core::arch::x86_64::_mm_prefetch((mt as *const _ as *const i8).add(i), core::arch::x86_64::_MM_HINT_T1);
+                    core::arch::x86_64::_mm_prefetch((mt as *const _ as *const i8).add(i), core::arch::x86_64::_MM_HINT_T2);
                 }
             }
 
