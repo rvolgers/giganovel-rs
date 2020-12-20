@@ -1,10 +1,18 @@
-[workspace]
+[package]
+name = "giganovel"
+version = "0.1.0"
+authors = ["Ronald Volgers <rvolgers@users.noreply.github.com>"]
+edition = "2018"
 
-members = [
-    "rand-python", "giganovel"
-]
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [profile.release]
 debug = true
 
-
+[dependencies]
+rand-python = "0.1.0"
+encoding_rs = "0.8.22"
+aho-corasick = "0.7.9"
+bstr = "0.2.11"
+lazy_static = "1.4.0"
+arrayvec = "0.5.1"

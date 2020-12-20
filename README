@@ -1,19 +1,8 @@
-https://codegolf.stackexchange.com/questions/188133/bentleys-coding-challenge-k-most-frequent-words
+# giganovel.rs
 
-https://www.reddit.com/r/rust/comments/fa5sbr/bentleys_coding_challenge_k_most_frequent_words/
+This is a Rust port of the `giganovel.py` script which is used as a test file to benchmark programs that find the k most frequent words.
 
-# Generate `ulysses64`:
+The original Python version can be found [here](https://gist.githubusercontent.com/amakukha/d519f9b09ed593bab9632bf12176c151/raw/03e3cca4f57e3fb20cb737e2704914eaacf7dab7/giganovel.py).
 
-wget http://www.gutenberg.org/files/4300/4300-0.txt
+On my system it takes about 30 minutes to generate the 1GB output file. This is obviously an unacceptably large yak, so I set out to shave it.
 
-for i in {1..64}; do cat 4300-0.txt >> ulysses64; done
-
-# Generate `giganovel`:
-
-wget https://gist.githubusercontent.com/amakukha/d519f9b09ed593bab9632bf12176c151/raw/03e3cca4f57e3fb20cb737e2704914eaacf7dab7/giganovel.py
-
-python3 giganovel.py > giganovel
-
-md5sum giganovel
-
-# 4dcf116dc35156ec939f8cafd61bdf18  giganovel
